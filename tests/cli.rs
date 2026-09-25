@@ -153,6 +153,7 @@ fn jit_boundary_flow() {
                 program: c.target.clone(),
                 tier: c.tier,
                 results: c.results.clone(),
+                buffers: c.buffers.clone(),
             };
             if cache.insert(key, entry, slot).is_err() {
                 return false;

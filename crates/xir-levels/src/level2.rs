@@ -99,6 +99,24 @@ impl ClusterSet {
         }
     }
 
+    /// CEP:WHAT: Builds a truly empty cluster set (no clusters, no owner
+    ///           table — every node reports unclustered).
+    /// CEP:WHY: The cluster-free projection path (`project`) and tests
+    ///          need a zero-sized sentinel without an arena reference;
+    ///          `cluster_of` returns None for every node by construction.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: none
+    /// CEP:ASSUMES: never assigned (assign() would reject the zero table).
+    /// CEP:COST: O(1).
+    /// CEP:EVIDENCE: level3 fused-projection tests use it as the baseline.
+    pub fn empty() -> ClusterSet {
+        ClusterSet {
+            clusters: Vec::new(),
+            owner: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
     /// CEP:WHAT: Adds an empty cluster and returns its index.
     /// CEP:STATUS: complete
     /// CEP:FAILURE: none
@@ -199,6 +217,24 @@ impl ClusterSet {
     /// CEP:EVIDENCE: tests
     pub fn is_empty(&self) -> bool {
         self.clusters.is_empty()
+    }
+
+    /// CEP:WHAT: Sets a cluster's force-materialization flag.
+    /// CEP:WHY: The resource model / repair pass marks over-budget or
+    ///          halo-heavy clusters: their intermediates MUST write to
+    ///          global memory even when consumed in-cluster (the
+    ///          bufferization escape hatch). Exposed as an API so the
+    ///          search driver and tests set it through the same contract.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: none (out-of-range index is a silent no-op — the
+    ///              caller's cluster handle came from add_cluster).
+    /// CEP:ASSUMES: cluster index from add_cluster.
+    /// CEP:COST: O(1).
+    /// CEP:EVIDENCE: level3 `materialized_cluster_forces_global`.
+    pub fn set_materialize(&mut self, cluster: u32, materialize: bool) {
+        if let Some(c) = self.clusters.get_mut(cluster as usize) {
+            c.materialize = materialize;
+        }
     }
 
     /// CEP:WHAT: Borrows a cluster by index.

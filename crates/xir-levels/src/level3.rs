@@ -48,14 +48,19 @@ pub enum LowerError {
 
 /// One scheduled op with resolved value slots.
 ///
-/// CEP:WHAT: Structured op record: opcode, input value slots, output slot.
+/// CEP:WHAT: Structured op record: opcode, input value slots, output slot,
+///           fusion-cluster provenance.
 /// CEP:WHY: The interpreter and target lowering execute from this form;
-///          value slots index the program's value table (dense u32).
+///          value slots index the program's value table (dense u32). The
+///          cluster field carries the fusion search's assignment (CEP-22
+///          half-closing: level-2 decisions ride INTO level-3 so target
+///          backends can exploit locality; None = unclustered).
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none (plain data).
 /// CEP:ASSUMES: input slots < value table size at execution.
-/// CEP:COST: 72 bytes.
-/// CEP:EVIDENCE: interpreter tests in runtime crate.
+/// CEP:COST: 80 bytes.
+/// CEP:EVIDENCE: interpreter tests in runtime crate; fused projection
+///           tests in this module.
 #[derive(Debug, Clone, Copy)]
 pub struct ScheduledOp {
     /// Opcode + immediates.
@@ -68,6 +73,9 @@ pub struct ScheduledOp {
     pub output: u32,
     /// Type of the produced value.
     pub ty: Type,
+    /// Owning fusion cluster (the search's assignment); None when the node
+    /// is unclustered or the projection was cluster-free.
+    pub cluster: Option<u32>,
 }
 
 /// The structured Level-3 program.
@@ -105,7 +113,51 @@ pub struct LoopProgram {
 /// CEP:SECURITY: bounds-checked mapping.
 /// CEP:HPC-DETERMINISM: deterministic.
 pub fn project(arena: &IrArena, roots: &[NodeId]) -> Result<LoopProgram, LowerError> {
-    let order = schedule(arena).map_err(LowerError::Schedule)?;
+    // Cluster-free projection: identical to the pre-CEP-22 behavior (slot
+    // tie-break scheduling, all-Global bufferization).
+    project_with_fusion(arena, roots, &crate::level2::ClusterSet::empty())
+}
+
+/// CEP:WHAT: Projects a sea-of-nodes arena into a LoopProgram HONORING the
+///           fusion search's winning ClusterSet.
+/// CEP:WHY: CEP-22 half-closing (audit F-3: "the search cannot influence
+///          anything"): the architecture's level-2 -> level-3 flow —
+///          "ClusterSet feeds the level-3 tiling decisions". Two concrete
+///          decisions land here: (1) SCHEDULING — schedule_fused's
+///          cluster-affinity Kahn groups cluster members adjacently
+///          (producer-consumer locality; topological legality untouched);
+///          (2) BUFFERIZATION — a tensor intermediate whose EVERY consumer
+///          lives in the same cluster (and whose producer's cluster is not
+///          force-materialized, and which is not a function result) never
+///          touches global memory: its buffer record becomes Register
+///          space. Cross-cluster values and results stay Global. This is
+///          the textbook fusion win expressed in the buffer plan — the
+///          CPU tier executes identically (semantics preserved, enforced
+///          differentially), and future register-allocating codegen reads
+///          the plan.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: LowerError (see enum); no partial output.
+/// CEP:ASSUMES: verified arena; `roots` are the result nodes; `clusters`
+///              built from THIS arena (assignment lookup is by slot).
+/// CEP:COST: O(nodes^2) fused scheduling + O(nodes * inputs) consumer map.
+/// CEP:EVIDENCE: tests `fused_projection_groups_members`,
+///           `intra_cluster_intermediate_is_register`,
+///           `cross_cluster_value_stays_global`; jit tier-2 bufferization
+///           differential test.
+/// CEP:SECURITY: bounds-checked mapping.
+/// CEP:HPC-DETERMINISM: deterministic (schedule_fused key, slot order).
+pub fn project_with_fusion(
+    arena: &IrArena,
+    roots: &[NodeId],
+    clusters: &crate::level2::ClusterSet,
+) -> Result<LoopProgram, LowerError> {
+    let has_clusters = !clusters.is_empty();
+    let order = if has_clusters {
+        xir_graph::schedule::schedule_fused(arena, |id| clusters.cluster_of(id))
+            .map_err(LowerError::Schedule)?
+    } else {
+        schedule(arena).map_err(LowerError::Schedule)?
+    };
     // Slot mapping: node index -> dense value slot.
     let mut slot_of: Vec<Option<u32>> = vec![None; arena.slot_count()];
     let mut ops: Vec<ScheduledOp> = Vec::with_capacity(order.len());
@@ -125,7 +177,9 @@ pub fn project(arena: &IrArena, roots: &[NodeId]) -> Result<LoopProgram, LowerEr
             params[idx] = node.ty;
         }
     }
-    // Non-param ops.
+    // Non-param ops (op-producing node ids kept in lockstep for the
+    // cluster-aware buffer plan).
+    let mut node_of_op: Vec<NodeId> = Vec::with_capacity(order.len());
     for id in order.iter() {
         let node = arena.node(*id).map_err(|_| LowerError::UnknownNode)?;
         if matches!(node.op, Op::Param { .. }) {
@@ -160,7 +214,13 @@ pub fn project(arena: &IrArena, roots: &[NodeId]) -> Result<LoopProgram, LowerEr
             n_inputs: node.n_inputs,
             output: out_slot,
             ty: node.ty,
+            cluster: if has_clusters {
+                clusters.cluster_of(*id)
+            } else {
+                None
+            },
         });
+        node_of_op.push(*id);
     }
     // Results.
     let mut results: Vec<u32> = Vec::with_capacity(roots.len());
@@ -172,16 +232,46 @@ pub fn project(arena: &IrArena, roots: &[NodeId]) -> Result<LoopProgram, LowerEr
             .ok_or(LowerError::UnknownNode)?;
         results.push(slot);
     }
-    // Buffer plan: tensor-producing ops get Global buffers sized by type.
+    // Buffer plan: tensor-producing ops get buffers sized by type. Under a
+    // fusion-aware projection the space honors the fusion decision: a
+    // tensor intermediate consumed ONLY inside its own cluster (not a
+    // result, cluster not force-materialized) is REGISTER space — it never
+    // materializes to global memory. Everything else stays Global.
+    // Consumers-by-slot map (O(nodes * inputs), built once; audit F-9 —
+    // ONLY on the fusion-aware path; the cluster-free path hardcodes
+    // Global and never reads it).
+    let consumers_of: Vec<Vec<NodeId>> = if has_clusters {
+        let mut m: Vec<Vec<NodeId>> = vec![Vec::new(); arena.slot_count()];
+        arena.for_each_live_node(|id, node| {
+            for i in 0..node.n_inputs as usize {
+                if i >= MAX_INPUTS {
+                    break;
+                }
+                let def = node.inputs[i].node();
+                let slot = def.index() as usize;
+                if slot < m.len() {
+                    m[slot].push(id);
+                }
+            }
+        });
+        m
+    } else {
+        Vec::new()
+    };
     let mut buffers: Vec<(u32, u32, AddressSpace)> = Vec::new();
-    for sop in ops.iter() {
+    for (sop, producer) in ops.iter().zip(node_of_op.iter()) {
         if let Type::Tensor(t) = sop.ty {
             let bytes = t
                 .shape
                 .num_elements()
                 .saturating_mul(i64::from(t.elem.byte_size()));
             let b32 = u32::try_from(bytes).unwrap_or(u32::MAX);
-            buffers.push((sop.output, b32, AddressSpace::Global));
+            let space = if has_clusters {
+                buffer_space(arena, roots, clusters, *producer, &consumers_of)
+            } else {
+                AddressSpace::Global
+            };
+            buffers.push((sop.output, b32, space));
         }
     }
     Ok(LoopProgram {
@@ -190,6 +280,71 @@ pub fn project(arena: &IrArena, roots: &[NodeId]) -> Result<LoopProgram, LowerEr
         results,
         buffers,
     })
+}
+
+/// CEP:WHAT: Chooses the address space for one tensor producer's buffer
+///           record under a fusion-aware projection.
+/// CEP:WHY: The fusion bufferization rule: Register space iff the producer
+///          is clustered, the cluster is not force-materialized, the value
+///          is not a function result, and EVERY consumer lives in the same
+///          cluster — an intermediate that never crosses a fusion boundary
+///          never materializes to global memory. Any miss (unclustered
+///          producer, materialize flag, result root, cross-cluster or
+///          absent consumer) degrades to Global: the conservative side is
+///          always Global because a wrong Register would be a
+///          miscompilation-class bug in a backend that trusts the plan.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: none (conservative Global on any doubt).
+/// CEP:ASSUMES: verified arena; consumers_of derived from the same arena;
+///           region-crossing uses degrade to Global (a Register value read
+///           from another control region would be a miscompilation in any
+///           backend that trusts the plan — audited F-7; can_fuse does not
+///           check regions, so this guard is the enforcement point).
+/// CEP:COST: O(consumers).
+/// CEP:EVIDENCE: tests `intra_cluster_intermediate_is_register`,
+///           `cross_cluster_value_stays_global`,
+///           `materialized_cluster_forces_global`,
+///           `result_root_stays_global`.
+fn buffer_space(
+    arena: &IrArena,
+    roots: &[NodeId],
+    clusters: &crate::level2::ClusterSet,
+    producer: NodeId,
+    consumers_of: &[Vec<NodeId>],
+) -> AddressSpace {
+    let Some(pc) = clusters.cluster_of(producer) else {
+        return AddressSpace::Global;
+    };
+    if clusters.cluster(pc).is_some_and(|c| c.materialize) {
+        return AddressSpace::Global;
+    }
+    if roots.contains(&producer) {
+        return AddressSpace::Global;
+    }
+    let consumers = consumers_of
+        .get(producer.index() as usize)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    if consumers.is_empty() {
+        return AddressSpace::Global;
+    }
+    let producer_region = match arena.node(producer) {
+        Ok(n) => n.region,
+        Err(_) => return AddressSpace::Global,
+    };
+    for c in consumers {
+        if clusters.cluster_of(*c) != Some(pc) {
+            return AddressSpace::Global;
+        }
+        // Region guard (audit F-7): a use in a DIFFERENT control region
+        // crosses control flow — Register would be unsound for any backend
+        // trusting the plan. Degrade to Global.
+        match arena.node(*c) {
+            Ok(cn) if cn.region == producer_region => {}
+            _ => return AddressSpace::Global,
+        }
+    }
+    AddressSpace::Register
 }
 
 /// CEP:WHAT: Total value count of the program (slots).
@@ -318,4 +473,252 @@ mod tests {
     // Silence unused import in non-test builds.
     #[allow(unused_imports)]
     use const_f64 as _unused_f64;
+
+    // ---- Fused projection (CEP-22 half-closing) ----
+
+    /// CEP:WHAT: Builds a tensor chain arena: p (param tensor) -> scale ->
+    ///           shift -> relu, all fusible elementwise pairs.
+    /// CEP:WHY: Shared fixture for the fused-projection tests.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: returns an empty arena on insert failure (tests assert).
+    /// CEP:ASSUMES: none.
+    /// CEP:COST: test-only
+    /// CEP:EVIDENCE: the three fused tests below.
+    fn tensor_chain_arena() -> (IrArena, Vec<NodeId>) {
+        use xir_core::id::ValueId;
+        use xir_core::ty::{Layout, Shape, TensorType};
+        let mut a = IrArena::with_capacity(16, 4);
+        let root = a.root_region();
+        let t = Type::Tensor(TensorType {
+            elem: ScalarType::F64,
+            shape: Shape::from_dims(&[2, 2]).unwrap_or(Shape::scalar()),
+            layout: Layout::RowMajor,
+        });
+        let param = a.insert_node(root, Node::new(Op::Param { index: 0 }, root, &[], t));
+        let two = const_f64(&mut a, root, 2.0);
+        let three = const_f64(&mut a, root, 3.0);
+        let mut ids = Vec::new();
+        if let (Ok(p), Ok(c2), Ok(c3)) = (param, two, three) {
+            let ip = a.value_of(p, 0);
+            let i2 = a.value_of(c2, 0);
+            if let (Ok(vp), Ok(v2)) = (ip, i2) {
+                let scale = a.insert_node(
+                    root,
+                    Node::new(Op::Binary(BinaryOp::Mul), root, &[vp, v2], t),
+                );
+                if let Ok(sc) = scale {
+                    let isc = a.value_of(sc, 0);
+                    let i3 = a.value_of(c3, 0);
+                    if let (Ok(vsc), Ok(v3)) = (isc, i3) {
+                        let shift = a.insert_node(
+                            root,
+                            Node::new(Op::Binary(BinaryOp::Add), root, &[vsc, v3], t),
+                        );
+                        if let Ok(sh) = shift {
+                            let ish = a.value_of(sh, 0);
+                            if let Ok(vsh) = ish {
+                                let relu = a.insert_node(
+                                    root,
+                                    Node::new(
+                                        Op::Unary(xir_core::op::UnaryOp::Relu),
+                                        root,
+                                        &[vsh],
+                                        t,
+                                    ),
+                                );
+                                if let Ok(r) = relu {
+                                    ids = vec![p, c2, c3, sc, sh, r];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = ValueId::NONE;
+        (a, ids)
+    }
+
+    // CEP:WHAT: The fused projection groups cluster members adjacently and
+    //           carries cluster provenance on the scheduled ops.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on adjacency or provenance drift.
+    // CEP:ASSUMES: {scale, shift, relu} in one cluster.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn fused_projection_groups_members() {
+        let (a, ids) = tensor_chain_arena();
+        if ids.len() == 6 {
+            let (p, c2, c3, sc, sh, r) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+            let mut clusters = crate::level2::ClusterSet::new(&a);
+            let c = clusters.add_cluster(0, 0);
+            let _ = clusters.assign(c, sc);
+            let _ = clusters.assign(c, sh);
+            let _ = clusters.assign(c, r);
+            let prog = project_with_fusion(&a, &[r], &clusters);
+            assert!(prog.is_ok());
+            if let Ok(pgm) = prog {
+                // Provenance: exactly the three members carry Some(c).
+                let tagged: Vec<bool> = pgm.ops.iter().map(|o| o.cluster == Some(c)).collect();
+                assert_eq!(tagged.iter().filter(|t| **t).count(), 3);
+                // Adjacency: scale, shift, relu are consecutive in op
+                // order (the two consts schedule first; the cluster members
+                // follow back-to-back — the affinity key at work).
+                let order: Vec<Op> = pgm.ops.iter().map(|o| o.op).collect();
+                assert_eq!(
+                    order,
+                    vec![
+                        Op::ConstF64(2.0),
+                        Op::ConstF64(3.0),
+                        Op::Binary(BinaryOp::Mul),
+                        Op::Binary(BinaryOp::Add),
+                        Op::Unary(xir_core::op::UnaryOp::Relu),
+                    ]
+                );
+                let _ = (p, c2, c3);
+            }
+        }
+    }
+
+    // CEP:WHAT: An intra-cluster tensor intermediate (consumed only inside
+    //           its cluster, not a result, not materialized) gets REGISTER
+    //           buffer space; the result stays Global.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the intermediate is materialized to
+    //               global or the result loses its global buffer.
+    // CEP:ASSUMES: {scale, shift, relu} clustered; scale/shift consumed
+    //               in-cluster; relu is the result.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn intra_cluster_intermediate_is_register() {
+        let (a, ids) = tensor_chain_arena();
+        if ids.len() == 6 {
+            let (sc, sh, r) = (ids[3], ids[4], ids[5]);
+            let mut clusters = crate::level2::ClusterSet::new(&a);
+            let c = clusters.add_cluster(0, 0);
+            let _ = clusters.assign(c, sc);
+            let _ = clusters.assign(c, sh);
+            let _ = clusters.assign(c, r);
+            let prog = project_with_fusion(&a, &[r], &clusters);
+            assert!(prog.is_ok());
+            if let Ok(pgm) = prog {
+                // Three tensor ops; the two intermediates are Register,
+                // the result root stays Global.
+                assert_eq!(pgm.buffers.len(), 3);
+                assert_eq!(pgm.buffers[0].2, AddressSpace::Register);
+                assert_eq!(pgm.buffers[1].2, AddressSpace::Register);
+                assert_eq!(pgm.buffers[2].2, AddressSpace::Global);
+            }
+        }
+    }
+
+    // CEP:WHAT: A tensor value consumed OUTSIDE its producer's cluster
+    //           stays Global; the cluster-free projection is all-Global.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on a cross-cluster Register (a
+    //               miscompilation-class bug for a backend trusting the
+    //               plan) or on cluster-free drift.
+    // CEP:ASSUMES: only {scale} clustered; shift/relu unclustered.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn cross_cluster_value_stays_global() {
+        let (a, ids) = tensor_chain_arena();
+        if ids.len() == 6 {
+            let (sc, r) = (ids[3], ids[5]);
+            let mut clusters = crate::level2::ClusterSet::new(&a);
+            let c = clusters.add_cluster(0, 0);
+            let _ = clusters.assign(c, sc);
+            // scale's consumer (shift) is unclustered -> cross-boundary.
+            let prog = project_with_fusion(&a, &[r], &clusters);
+            assert!(prog.is_ok());
+            if let Ok(pgm) = prog {
+                assert_eq!(pgm.buffers.len(), 3);
+                for b in pgm.buffers.iter() {
+                    assert_eq!(b.2, AddressSpace::Global);
+                }
+            }
+            // Cluster-free baseline: everything Global.
+            let plain = project(&a, &[r]);
+            assert!(plain.is_ok());
+            if let Ok(pp) = plain {
+                assert_eq!(pp.buffers.len(), 3);
+                for b in pp.buffers.iter() {
+                    assert_eq!(b.2, AddressSpace::Global);
+                }
+                for o in pp.ops.iter() {
+                    assert_eq!(o.cluster, None);
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: A force-materialized cluster writes its intermediates to
+    //           Global even when consumed in-cluster (the resource
+    //           model's escape hatch).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if materialize is ignored.
+    // CEP:ASSUMES: {scale, shift, relu} clustered with materialize = true.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn materialized_cluster_forces_global() {
+        let (a, ids) = tensor_chain_arena();
+        if ids.len() == 6 {
+            let (sc, sh, r) = (ids[3], ids[4], ids[5]);
+            let mut clusters = crate::level2::ClusterSet::new(&a);
+            let c = clusters.add_cluster(0, 0);
+            let _ = clusters.assign(c, sc);
+            let _ = clusters.assign(c, sh);
+            let _ = clusters.assign(c, r);
+            // Force materialize on the cluster.
+            clusters.set_materialize(c, true);
+            let prog = project_with_fusion(&a, &[r], &clusters);
+            assert!(prog.is_ok());
+            if let Ok(pgm) = prog {
+                assert_eq!(pgm.buffers.len(), 3);
+                for b in pgm.buffers.iter() {
+                    assert_eq!(b.2, AddressSpace::Global);
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: A RESULT ROOT stays Global even when its value is consumed
+    //           entirely inside its own cluster (the caller must be able
+    //           to read the function output — audit F-2: this named test
+    //           completes the buffer_space evidence list).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if a root loses its global buffer.
+    // CEP:ASSUMES: root = the mid-chain add; relu consumes it in-cluster.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn result_root_stays_global() {
+        let (a, ids) = tensor_chain_arena();
+        if ids.len() == 6 {
+            let (sc, sh, r) = (ids[3], ids[4], ids[5]);
+            let mut clusters = crate::level2::ClusterSet::new(&a);
+            let c = clusters.add_cluster(0, 0);
+            let _ = clusters.assign(c, sc);
+            let _ = clusters.assign(c, sh);
+            let _ = clusters.assign(c, r);
+            // ROOT = the mid-chain add (sh), NOT the relu: the add's value
+            // crosses to the CALLER even though relu consumes it too.
+            let prog = project_with_fusion(&a, &[sh], &clusters);
+            assert!(prog.is_ok());
+            if let Ok(pgm) = prog {
+                assert_eq!(pgm.buffers.len(), 3);
+                // scale: consumed in-cluster only -> Register.
+                assert_eq!(pgm.buffers[0].2, AddressSpace::Register);
+                // add: in-cluster consumer BUT a result root -> Global.
+                assert_eq!(pgm.buffers[1].2, AddressSpace::Global);
+                // relu: no consumers (dead under this root set, kept live
+                // by the arena) -> conservative Global.
+                assert_eq!(pgm.buffers[2].2, AddressSpace::Global);
+            }
+        }
+    }
 }

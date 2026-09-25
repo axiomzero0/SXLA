@@ -72,6 +72,7 @@ mod tests {
                 n_inputs: 1,
                 output: 1,
                 ty: xir_core::ty::Type::Scalar(xir_core::ty::ScalarType::F64),
+                cluster: None,
             }],
             results: vec![1],
             buffers: vec![],

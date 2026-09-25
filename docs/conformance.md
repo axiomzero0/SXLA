@@ -39,6 +39,7 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Resource model + repair | complete | resource/repair tests |
 | Tiered cost model | partial | Tier 1 complete; Tier 2 placeholder; Tier 3 loud stub (CEP-20/21) |
 | Universe search + atomic pruning | partial | search tests; recursive tree granularity = CEP-22 |
+| Fusion decisions feed level-3 (fused scheduling + bufferization) | complete | level3 fused tests + jit `tier2_fusion_changes_bufferization` |
 | JIT cache (EBR-sharded) | complete | cache tests |
 | SPSC JIT boundary | complete | boundary tests (incl. cross-thread) |
 | Tier manifests 0/1/2 | complete | driver tests + differential tier test |
@@ -76,8 +77,11 @@ were remediated with regression tests:
   scoped worker (`set_in_region_scoped`).
 - **S1-3 (swallowed failure + dead stage)**: Tier-2's fusion search
   discarded its Result and fed nothing downstream; the error now propagates
-  (`JitError::Pipeline("fusion-search")`) and the docs state the ClusterSet
-  does not yet feed structurize (CEP-22).
+  (`JitError::Pipeline("fusion-search")`). The dead-analysis half was
+  closed in the FOLLOW-UP increment: the winning ClusterSet now feeds
+  `project_with_fusion` (cluster-affinity scheduling + Register/Global
+  bufferization) — see "Fusion decisions feed level-3" above. The search's
+  recursive tree granularity remains CEP-22.
 - S2s: float bits escape form for non-finite/oversized constants
   (`float_bits_roundtrip`); EGraph::merge canonicalizes both arguments;
   provable folds fire when the folded const dedups onto an existing arena
@@ -96,6 +100,29 @@ were remediated with regression tests:
 The pool's lending discipline (the audit's focus area A) was certified
 airtight across publish/trampoline/check-in/reap interleavings, panic
 paths, Drop ordering, and hint/authority races.
+
+## Third audit round (session 2, increment 2) and remediation
+
+An audit of the fused-projection increment (schedule_fused, buffer_space,
+project_with_fusion, driver wiring) found 0 S0, 2 S1, 7 S2. All remediated:
+
+- **S1-1 (unpinned mechanism)**: no test discriminated the cluster-affinity
+  key from plain slot order; `fused_schedule_affinity_beats_slot` now pins
+  it (a stranger at a slot between cluster members is pulled before the
+  pair — plain slot order would interleave it).
+- **S1-2 (phantom evidence)**: `buffer_space` cited a nonexistent test;
+  `result_root_stays_global` now exists (a mid-chain result root stays
+  Global despite in-cluster consumption).
+- S2s: level2 doc-block corruption repaired (cluster()/set_materialize());
+  schedule_fused COST stated honestly (Theta(n^2) always vs the batched
+  plain scheduler's O(depth*(n+e))); dangling uses report UnknownNode (not
+  a bogus Cycle) matching the plain scheduler's contract; KernelEntry and
+  the boundary flow carry the buffer plan (cache hits deliver the same
+  artifact as a direct compile); buffer_space is region-guarded (uses in
+  another control region degrade to Global) with the assumption
+  documented; the tier-2 manifest's phantom `verify` token dropped (the
+  search is read-only over the verified arena); the consumers map builds
+  only on the fusion-aware path.
 
 ## Waivers
 

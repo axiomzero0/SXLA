@@ -81,6 +81,7 @@ mod tests {
                 n_inputs: 2,
                 output: 2,
                 ty: Type::Scalar(ScalarType::F64),
+                cluster: None,
             }],
             results: vec![2],
             buffers: vec![],

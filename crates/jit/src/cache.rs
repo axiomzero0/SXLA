@@ -60,6 +60,10 @@ pub struct KernelEntry {
     pub tier: Tier,
     /// Result value slots (execution outputs).
     pub results: Vec<u32>,
+    /// Level-3 bufferization record (audit F-6: cache hits must deliver
+    /// the SAME artifact completeness as a direct compile — the Tier-2
+    /// Register/Global plan rides along).
+    pub buffers: Vec<(u32, u32, xir_core::ty::AddressSpace)>,
 }
 
 /// The JIT cache.
@@ -134,6 +138,7 @@ impl JitCache {
                 program: entry.program.clone(),
                 tier: entry.tier,
                 results: entry.results.clone(),
+                buffers: entry.buffers.clone(),
             }))),
             None => Ok(None),
         }
@@ -260,6 +265,7 @@ mod tests {
                 n_inputs: 2,
                 output: 2,
                 ty: Type::Scalar(ScalarType::F64),
+                cluster: None,
             }],
             results: vec![2],
             buffers: vec![],
@@ -276,6 +282,7 @@ mod tests {
             program: tp,
             tier: Tier::Tier1,
             results: vec![2],
+            buffers: vec![],
         }
     }
 

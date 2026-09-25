@@ -684,6 +684,7 @@ mod tests {
                 n_inputs: n,
                 output: out,
                 ty: Type::Scalar(ScalarType::F64),
+                cluster: None,
             })
             .collect();
         lower(&LoopProgram {
