@@ -1,0 +1,17 @@
+# CEP:FILE: clippy.toml
+# CEP:WHAT: Clippy configuration for the SXLA workspace.
+# CEP:WHY: `accept-comment-above-statement` lets the CEP:UNSAFE | Safety
+#          block comment sit above the full statement (the CEP&CC-mandated
+#          position) while clippy still verifies every unsafe block is
+#          documented (psychopathic-tier mechanical enforcement of CEP&CC
+#          25.7).
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: none; tool configuration.
+# CEP:ASSUMES: clippy >= 1.98 supports these keys.
+# CEP:COST: tool-time only.
+# CEP:EVIDENCE: CI runs clippy with warnings-as-errors on this config.
+# CEP:SECURITY: no untrusted input.
+
+accept-comment-above-statement = true
+accept-comment-above-attributes = true

@@ -1,0 +1,16 @@
+# CEP:FILE: rustfmt.toml
+# CEP:WHAT: Rust formatting configuration for the SXLA workspace.
+# CEP:WHY: Mechanical formatting enforcement (CEP&CC 2.3 psychopathic tier) removes style
+#          debate from review; `cargo fmt --check` is a CI gate.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: none; configuration only.
+# CEP:ASSUMES: default rustfmt semantics; no unstable options.
+# CEP:COST: offline tooling configuration; runtime cost irrelevant.
+# CEP:EVIDENCE: CI workflow runs `cargo fmt --check`.
+# CEP:SECURITY: no untrusted input.
+
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"

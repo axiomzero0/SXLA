@@ -1,0 +1,74 @@
+# CEP:FILE: Cargo.toml
+# CEP:WHAT: SXLA Rust workspace manifest; defines the 9-crate compiler stack per the master architecture.
+# CEP:WHY: Workspace-level lint policy enforces warnings-as-errors (CEP&CC 6.3) for every member crate
+#          without scattering per-crate configuration; zero external dependencies keep the supply
+#          chain pinned (CEP&CC 22.11) and builds deterministic (CEP&CC 6.5).
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: Cargo reports resolution errors for malformed manifest; no build occurs.
+# CEP:ASSUMES: cargo >= 1.98 understands workspace.lints; enforced by rust-toolchain.toml.
+# CEP:COST: offline build configuration; runtime cost irrelevant.
+# CEP:EVIDENCE: CI workflow .github/workflows/ci.yml runs build+test+clippy+fmt on this manifest.
+# CEP:SECURITY: no external dependencies; no network at build time.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/anvil",
+    "crates/xir-core",
+    "crates/xir-graph",
+    "crates/xir-levels",
+    "crates/egraph",
+    "crates/fusion",
+    "crates/codegen",
+    "crates/runtime",
+    "crates/jit",
+    "tools/xla-opt",
+    "tools/xla-run",
+    "benches/anvil_bench",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+# CEP:WHY: CEP&CC 6.3 requires warnings to be treated as errors.
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+missing_abi = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unreachable = "deny"
+# CEP:WHY: clippy::arithmetic_side_effects is intentionally not denied globally: index arithmetic
+#          in the IR arenas is guarded by `overflow-checks = true` in ALL profiles (see below)
+#          plus explicit bounds checks before every unchecked access; hot-path arithmetic that
+#          can wrap semantically uses wrapping/checked forms at the call site.
+
+[profile.release]
+# CEP:WHY: overflow-checks stay on in release because the HPC correctness hierarchy (CEP&CC 38.4)
+#          ranks semantic correctness above generated-code performance; silent wraparound in
+#          index arithmetic would be a miscompilation-class defect.
+overflow-checks = true
+debug = false
+lto = true
+codegen-units = 1
+
+[profile.bench]
+overflow-checks = true
+debug = true

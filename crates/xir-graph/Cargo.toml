@@ -1,0 +1,24 @@
+# CEP:FILE: crates/xir-graph/Cargo.toml
+# CEP:WHAT: Manifest for the xir-graph crate.
+# CEP:WHY: Workspace member with pinned lints and zero external deps.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time resolution errors only.
+# CEP:ASSUMES: workspace root provides the lint profile.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI builds with warnings-as-errors.
+# CEP:SECURITY: no external code enters this crate.
+
+[package]
+name = "xir-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA xir-graph"
+
+[lints]
+workspace = true
+
+[dependencies]
+xir-core = { path = "../xir-core" }

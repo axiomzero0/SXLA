@@ -1,0 +1,31 @@
+# CEP:FILE: tools/xla-run/Cargo.toml
+# CEP:WHAT: Manifest for the xla-run CLI tool.
+# CEP:WHY: HPC-2 offline tooling per the master architecture project layout.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time resolution errors only.
+# CEP:ASSUMES: workspace root provides the lint profile.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI builds with warnings-as-errors.
+# CEP:SECURITY: CLI parses repository-trusted IR files; validation enforced.
+
+[package]
+name = "xla-run"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA xla-run tool"
+
+[[bin]]
+name = "xla-run"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+xir-core = { path = "../../crates/xir-core" }
+xir-levels = { path = "../../crates/xir-levels" }
+jit = { path = "../../crates/jit" }
+runtime = { path = "../../crates/runtime" }

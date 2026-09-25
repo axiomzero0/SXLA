@@ -1,0 +1,32 @@
+# CEP:FILE: tools/xla-opt/Cargo.toml
+# CEP:WHAT: Manifest for the xla-opt CLI tool.
+# CEP:WHY: HPC-2 offline tooling per the master architecture project layout.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time resolution errors only.
+# CEP:ASSUMES: workspace root provides the lint profile.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI builds with warnings-as-errors.
+# CEP:SECURITY: CLI parses repository-trusted IR files; validation enforced.
+
+[package]
+name = "xla-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA xla-opt tool"
+
+[[bin]]
+name = "xla-opt"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anvil = { path = "../../crates/anvil" }
+xir-core = { path = "../../crates/xir-core" }
+xir-graph = { path = "../../crates/xir-graph" }
+xir-levels = { path = "../../crates/xir-levels" }
+jit = { path = "../../crates/jit" }

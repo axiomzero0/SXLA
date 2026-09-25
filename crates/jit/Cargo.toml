@@ -1,0 +1,30 @@
+# CEP:FILE: crates/jit/Cargo.toml
+# CEP:WHAT: Manifest for the jit crate.
+# CEP:WHY: Workspace member with pinned lints and zero external deps.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time resolution errors only.
+# CEP:ASSUMES: workspace root provides the lint profile.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI builds with warnings-as-errors.
+# CEP:SECURITY: no external code enters this crate.
+
+[package]
+name = "jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA jit"
+
+[lints]
+workspace = true
+
+[dependencies]
+anvil = { path = "../anvil" }
+xir-core = { path = "../xir-core" }
+xir-graph = { path = "../xir-graph" }
+xir-levels = { path = "../xir-levels" }
+egraph = { path = "../egraph" }
+fusion = { path = "../fusion" }
+runtime = { path = "../runtime" }

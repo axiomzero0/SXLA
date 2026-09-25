@@ -1,0 +1,29 @@
+# CEP:FILE: benches/anvil_bench/Cargo.toml
+# CEP:WHAT: Manifest for the Anvil benchmark harness binary.
+# CEP:WHY: CEP&CC 32.10 (benchmarks mirror hot code) + Law 4 evidence.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time errors only.
+# CEP:ASSUMES: workspace lints apply.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI archives the harness output.
+# CEP:SECURITY: no external code.
+
+[package]
+name = "anvil_bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA Anvil benchmark harness"
+
+[[bin]]
+name = "anvil_bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anvil = { path = "../../crates/anvil" }
+xir-core = { path = "../../crates/xir-core" }

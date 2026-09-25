@@ -1,0 +1,33 @@
+# CEP:FILE: tests/Cargo.toml
+# CEP:WHAT: Manifest for the SXLA integration test package (mirrors source
+#          per CEP&CC 32.8).
+# CEP:WHY: Workspace-root integration tests need a host package; this
+#          package exists solely for tests/ targets.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time errors only.
+# CEP:ASSUMES: workspace lints apply.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI runs `cargo test --workspace`.
+# CEP:SECURITY: no external code.
+
+[package]
+name = "sxla-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA integration tests (differential, CLI, boundary)"
+
+[lints]
+workspace = true
+
+[[test]]
+name = "cli"
+path = "cli.rs"
+
+[dependencies]
+jit = { path = "../crates/jit" }
+runtime = { path = "../crates/runtime" }
+anvil = { path = "../crates/anvil" }
+xir-core = { path = "../crates/xir-core" }

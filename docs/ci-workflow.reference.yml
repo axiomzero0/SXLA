@@ -1,0 +1,72 @@
+# CEP:FILE: .github/workflows/ci.yml
+# CEP:WHAT: SXLA continuous integration — build, test, clippy, fmt, CEP lint,
+#          bench evidence, and the sanitizer matrix.
+# CEP:WHY: CEP&CC 2.3 (mechanical enforcement), 6.3 (warnings-as-errors),
+#          6.6 (sanitizers in CI), 16 (CI can block non-compliant merges).
+# CEP:CLASS: CEP-2
+# CEP:STATUS: partial
+# CEP:FAILURE: any gate failing fails the workflow; sanitizers run on
+#          nightly with continue-on-error until CEP-27 wires them as hard
+#          gates.
+# CEP:ASSUMES: pinned toolchain from rust-toolchain.toml.
+# CEP:COST: CI minutes; offline cacheable build (zero deps).
+# CEP:EVIDENCE: workflow runs themselves are the artifact register.
+# CEP:SECURITY: pinned actions by major tag; no secrets needed.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build + test + clippy + fmt + cep-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Build (warnings-as-errors via workspace lints)
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: CEP comment-field lint (CEP&CC 10.2/10.10)
+        run: python3 scripts/cep_lint.py crates tools benches tests
+      - name: Benchmark evidence (advisory archive)
+        run: |
+          cargo run --release --bin anvil_bench | tee .cep/evidence/bench-${{ github.sha }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-evidence
+          path: .cep/evidence/
+
+  sanitizers:
+    name: sanitizers (ASan/UBSan; TSan nightly)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # CEP-27: promote to hard gates after burn-in
+    strategy:
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Run tests under ${{ matrix.sanitizer }}
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+        run: |
+          cargo +nightly test --workspace --tests --target x86_64-unknown-linux-gnu
+# NOTE: this workflow file is provided as a reference copy under docs/
+# because the pushing credential lacks `workflow` scope (GitHub rejects
+# .github/workflows changes from such tokens). Copy it to
+# .github/workflows/ci.yml in the repository settings or push it with a
+# workflow-scoped token to activate the CI gates.

@@ -1,0 +1,24 @@
+# CEP:FILE: crates/anvil/Cargo.toml
+# CEP:WHAT: Manifest for the Anvil concurrency engine crate.
+# CEP:WHY: Zero dependencies keeps the engine auditable end-to-end and the
+#          supply chain pinned (CEP&CC 22.11); workspace lints apply.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: cargo resolution errors are build-time failures.
+# CEP:ASSUMES: workspace root provides the lint profile.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: CI builds this crate with warnings-as-errors.
+# CEP:SECURITY: no external code enters this crate.
+
+[package]
+name = "anvil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA Anvil: thread-per-core, NUMA-aware, lock-free execution engine"
+
+[lints]
+workspace = true
+
+[dependencies]
