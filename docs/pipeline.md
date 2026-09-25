@@ -16,10 +16,17 @@ publication.
 ## sxla-tier2-2026-09
 
 ```
-verify(entry) -> canonicalize-l0 -> egraph-saturate (analysis; ReadOnly) ->
-fusion-search (universes A/B/C, atomic pruning) -> verify -> structurize -> lower-target
+verify(entry) -> canonicalize-l0 -> egraph-apply@2 (Transactional; saturate ->
+extract -> apply -> DCE) -> fusion-search (universes A/B/C, atomic pruning) ->
+verify -> structurize -> lower-target
 ```
 
+The e-graph pass is the CEP-17 extraction application: saturation discovers
+equalities under Gear-1 partitioning (pooled since CEP-3), extraction
+selects the cheapest program (fusion-aware penalties), and application
+lands the rewrites through the transactional clone-mutate-verify-publish
+discipline. Regression: `tier2_egraph_identity_diverges_from_tier1`
+(param + 0 eliminated at Tier 2 only; values agree differentially).
 The fusion search is a scheduling transformation; semantic equivalence is
 enforced by the differential test `differential_fusion_equivalence`
 (CEP&CC 38.45).
@@ -42,5 +49,6 @@ Every pass carries its full `CEP:HPC-PASS-*` block at its implementation:
 - `gvn` — crates/xir-graph/src/gvn.rs
 - `dce` — crates/xir-graph/src/dce.rs
 - `layout-infer` — crates/xir-levels/src/level1.rs
-- `egraph-saturate` — crates/egraph/src/saturate.rs (driver fields)
+- `egraph-apply` — crates/egraph/src/apply.rs (driver fields)
+- `egraph-saturate` — crates/egraph/src/saturate.rs (analysis entry)
 - `fusion-search` — crates/fusion/src/search.rs

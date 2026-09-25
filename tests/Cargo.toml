@@ -31,3 +31,4 @@ jit = { path = "../crates/jit" }
 runtime = { path = "../crates/runtime" }
 anvil = { path = "../crates/anvil" }
 xir-core = { path = "../crates/xir-core" }
+xir-graph = { path = "../crates/xir-graph" }

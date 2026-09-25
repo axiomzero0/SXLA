@@ -56,6 +56,11 @@ pub enum VerifierError {
     SlotInvalid(NodeId),
     /// The region tree contains a cycle or a stale parent.
     RegionTreeInvalid(NodeId),
+    /// A region's owner linkage is invalid (dead owner, non-If owner, or
+    /// owner outside the region's parent) — CEP-12.
+    BadRegionOwner(NodeId),
+    /// An If node does not own exactly two (then, else) regions — CEP-12.
+    BadIfRegions(NodeId),
 }
 
 /// Expected input arity per opcode (the closed contract).
@@ -127,6 +132,31 @@ pub fn verify(arena: &IrArena) -> Result<(), VerifierError> {
         }
         slot += 1;
     }
+    // Phase 1.5: If-region owner linkage (CEP-12) — an owned region's
+    // owner must be a LIVE If node living in the region's parent. The
+    // same scan tallys owned-region counts for the phase-2 If check.
+    let mut owned_counts: Vec<u8> = vec![0; arena.slot_count()];
+    let mut owner_bad: Option<VerifierError> = None;
+    arena.for_each_region(|_rid, r| {
+        if owner_bad.is_some() || r.owner.is_none() {
+            return;
+        }
+        match arena.node(r.owner) {
+            Ok(owner_node) if owner_node.op == Op::If && owner_node.region == r.parent => {
+                let idx = r.owner.index() as usize;
+                if idx < owned_counts.len() && owned_counts[idx] < u8::MAX {
+                    owned_counts[idx] += 1;
+                }
+            }
+            _ => {
+                // Dead owner, non-If owner, or owner outside the parent.
+                owner_bad = Some(VerifierError::BadRegionOwner(r.owner));
+            }
+        }
+    });
+    if let Some(e) = owner_bad {
+        return Err(e);
+    }
     // Phase 2: per-node checks (use-def, arity, types, effects) + the
     // dominance check: every input's defining region must dominate (be an
     // ancestor-or-self of) the consuming node's region (38.18 mapping).
@@ -134,6 +164,14 @@ pub fn verify(arena: &IrArena) -> Result<(), VerifierError> {
     arena.for_each_live_node(|id, node| {
         if bad.is_some() {
             return;
+        }
+        if node.op == Op::If {
+            // Structural contract: exactly two owned regions (then, else).
+            let count = owned_counts.get(id.index() as usize).copied().unwrap_or(0);
+            if count != 2 {
+                bad = Some(VerifierError::BadIfRegions(id));
+                return;
+            }
         }
         if let Some(e) = verify_node(arena, id, node) {
             bad = Some(e);
@@ -424,8 +462,8 @@ mod tests {
         let root = a.root_region();
         // r1 (child of root) defines; r2 (sibling) uses — r1 does not
         // dominate r2.
-        let r1 = a.new_region(root);
-        let r2 = a.new_region(root);
+        let r1 = a.new_region(root, xir_core::id::NodeId::NONE);
+        let r2 = a.new_region(root, xir_core::id::NodeId::NONE);
         if let (Ok(reg1), Ok(reg2)) = (r1, r2) {
             let c = const_f64(&mut a, reg1, 1.0);
             assert!(c.is_ok());
@@ -476,6 +514,87 @@ mod tests {
         assert!(id.is_ok());
         if let Ok(id) = id {
             assert_eq!(verify(&a), Err(VerifierError::TypeInvalid(id)));
+        }
+    }
+
+    // CEP:WHAT: An If node without exactly two owned regions fails
+    //           verification (CEP-12 structural contract).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the missing-region If verifies.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn if_without_regions_detected() {
+        let mut a = IrArena::with_capacity(16, 8);
+        let root = a.root_region();
+        let c = const_f64(&mut a, root, 1.0);
+        assert!(c.is_ok());
+        if let Ok(cv) = c {
+            if let Ok(cond) = a.value_of(cv, 0) {
+                let node = Node::new(
+                    Op::If,
+                    root,
+                    &[cond],
+                    Type::Scalar(xir_core::ty::ScalarType::F64),
+                );
+                let id = a.insert_node(root, node);
+                assert!(id.is_ok());
+                if let Ok(id) = id {
+                    assert_eq!(verify(&a), Err(VerifierError::BadIfRegions(id)));
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: A region owned by a non-If (or parent-mismatched) node
+    //           fails verification (CEP-12 linkage contract).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the bad linkage verifies.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn bad_region_owner_detected() {
+        let mut a = IrArena::with_capacity(16, 8);
+        let root = a.root_region();
+        let c = const_f64(&mut a, root, 1.0);
+        assert!(c.is_ok());
+        if let Ok(cv) = c {
+            // Owner is a Const node (not an If): linkage invalid.
+            let r = a.new_region(root, cv);
+            assert!(r.is_ok());
+            if r.is_err() {
+                return;
+            }
+            assert_eq!(verify(&a), Err(VerifierError::BadRegionOwner(cv)));
+        }
+    }
+
+    // CEP:WHAT: A text-parsed if-region program verifies cleanly (the
+    //           happy path: 2 owned regions, dominance holds for pre-if
+    //           uses inside the blocks).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if a well-formed if program is rejected.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn text_if_program_verifies() {
+        let src = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<f64>\n",
+            "  %1 = if %0 : scalar<f64> {\n",
+            "    %2 = binary.mul %0, %0 : scalar<f64>\n",
+            "  } else {\n",
+            "    %3 = binary.add %0, %0 : scalar<f64>\n",
+            "  }\n",
+            "}\n",
+        );
+        let arena = xir_core::text::parse_arena(src, 64);
+        assert!(arena.is_ok(), "parse error: {:?}", arena.err());
+        if let Ok(a) = arena {
+            assert_eq!(verify(&a), Ok(()));
         }
     }
 }

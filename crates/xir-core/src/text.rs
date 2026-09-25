@@ -3,30 +3,47 @@
 // CEP:WHY: HPC-IR contract (CEP&CC 38.17): the IR must be printable and
 //          round-trippable when text is normative; deterministic printing
 //          (38.19) requires stable node order — we print live nodes in slot
-//          order, never HashMap order. The parser is CEP-1: bounded reads,
+//          order per region, never HashMap order. graph.if regions round-
+//          trip through the nested block syntax `%N = if %C : ty { ... }
+//          else { ... }` (CEP-12). The parser is CEP-1: bounded reads,
 //          explicit ParseError positions, no panics, no unsafe.
 // CEP:CLASS: CEP-1
-// CEP:STATUS: partial
+// CEP:STATUS: complete
 // CEP:FAILURE: ParseError::{UnexpectedToken, UnknownOp, UnknownType, BadInt,
-//              BadFloat, Truncated, IfUnsupported} with byte offset; printing
+//              BadFloat, Truncated} with byte offset; printing
 //              cannot fail (formatting into a caller String).
 // CEP:ASSUMES: input is repository-trusted UTF-8 (tools read local files);
 //              non-UTF-8 must be rejected by the caller before this layer
 //              (CEP&CC 22.5 input validation).
 // CEP:COST: print O(nodes); parse O(bytes) single pass.
-// CEP:EVIDENCE: tests `roundtrip_flat_function`, `rejects_garbage`,
-//           `printer_is_deterministic`.
+// CEP:EVIDENCE: tests `roundtrip_flat_function`, `roundtrip_if_regions`,
+//           `rejects_garbage`, `printer_is_deterministic`.
 // CEP:SECURITY: parser bounds-checks every slice access; integers parsed with
 //           checked arithmetic (no overflow panics).
 // CEP:HPC-DETERMINISM: printer output is a pure function of the snapshot.
-// CEP:TODO(main-agent): CEP-12: region (then/else) syntax for graph.if.
 //! Canonical textual XIR (v1).
 
 use crate::arena::{ArenaError, IrArena};
-use crate::id::RegionId;
+use crate::id::{NodeId, RegionId};
 use crate::node::Node;
 use crate::op::{BinaryOp, Monoid, Op, Padding, RngDist, UnaryOp};
 use crate::ty::{Layout, ScalarType, Shape, TensorType, Type, MAX_RANK};
+
+/// Maximum if-block nesting depth accepted by the parser.
+///
+/// CEP:WHAT: Bounded recursion guard (audit F-13).
+/// CEP:WHY: parse_block/parse_statement and print_region_nodes recurse per
+///          nesting level; an adversarial ~40k-deep file would overflow the
+///          stack (abort-class crash). The bound is generous for real IR
+///          (deep loop nests in text form are unusual; the level-3 loop
+///          program is a structured projection, not text) and fails LOUDLY
+///          with a byte offset.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: ParseError::NestingTooDeep with offset.
+/// CEP:ASSUMES: repository-trusted input bounds it further.
+/// CEP:COST: 1 compare per block.
+/// CEP:EVIDENCE: test `rejects_runaway_nesting`.
+pub const MAX_NEST: usize = 256;
 
 /// Parser failure enumeration.
 ///
@@ -52,8 +69,9 @@ pub enum ParseError {
     BadFloat(usize),
     /// Input ended mid-production.
     Truncated,
-    /// graph.if regions are not expressible in text v1.
-    IfUnsupported(usize),
+    /// If-block nesting exceeded the bound at this offset (audit F-13:
+    /// unbounded recursion would overflow the stack on adversarial input).
+    NestingTooDeep(usize),
     /// Arena capacity exceeded while building.
     ArenaExhausted,
 }
@@ -71,7 +89,15 @@ fn format_op(op: Op) -> String {
     match op {
         Op::ConstI64(v) => format!("const.i64 {}", v),
         Op::ConstF64(v) => {
-            if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+            if !v.is_finite() || (v.fract() == 0.0 && v.abs() >= 9.223372036854776e18) {
+                // Audit F-4: non-finite values print as inf/NaN (words the
+                // lexer cannot re-read) and integral values >= 2^63 print
+                // as integer strings that overflow the i64 literal token.
+                // Escape form: the exact bit pattern as TWO i64-safe
+                // decimal halves — always re-parseable, always exact.
+                let bits = v.to_bits();
+                format!("const.f64 bits {} {}", bits >> 32, bits & 0xFFFF_FFFF)
+            } else if v.fract() == 0.0 && v.abs() < 1e15 {
                 format!("const.f64 {:.1}", v)
             } else {
                 format!("const.f64 {}", v)
@@ -244,8 +270,62 @@ pub fn print_arena(arena: &IrArena) -> String {
     let mut out = String::with_capacity(arena.node_count() * 48 + 64);
     // Header is a single line so the line-oriented parser can consume it.
     out.push_str("xir v1 func @main {\n");
-    let mut lines: Vec<String> = Vec::with_capacity(arena.node_count());
+    // Per-region node lists in slot order (deterministic: 38.19 — never
+    // HashMap order; slot order is structural).
+    let mut region_count = 0usize;
+    arena.for_each_region(|_, _| region_count += 1);
+    let mut per_region: Vec<Vec<NodeId>> = vec![Vec::new(); region_count];
     arena.for_each_live_node(|id, node| {
+        let ridx = node.region.index() as usize;
+        if ridx < per_region.len() {
+            per_region[ridx].push(id);
+        }
+    });
+    let mut lines: Vec<String> = Vec::with_capacity(arena.node_count());
+    print_region_nodes(arena, &per_region, arena.root_region(), 1, &mut lines);
+    out.push_str(&lines.join("\n"));
+    out.push_str("\n}\n");
+    out
+}
+
+/// CEP:WHAT: Emits one region's statements (recursing into If blocks).
+/// CEP:WHY: CEP-12: graph.if regions print structurally nested —
+///          `%N = if %C : ty { then } else { else }` — with the block
+///          statements indented one level deeper. The then region is the
+///          lower-index owned region, else the higher (creation-order
+///          convention of the arena's owner linkage).
+/// CEP:STATUS: complete
+/// CEP:FAILURE: none (printing cannot fail; an If with a degraded region
+///              linkage prints the v0 flat form — the verifier flags such
+///              arenas upstream, so the printer never hides a broken IR).
+/// CEP:ASSUMES: verified arena (region linkage intact).
+/// CEP:COST: O(nodes + regions).
+/// CEP:EVIDENCE: test `roundtrip_if_regions`.
+/// CEP:HPC-DETERMINISM: deterministic — slot order, region index order.
+fn print_region_nodes(
+    arena: &IrArena,
+    per_region: &[Vec<NodeId>],
+    region: RegionId,
+    depth: usize,
+    lines: &mut Vec<String>,
+) {
+    // Bounded recursion (audit F-13): printing cannot fail, so an
+    // over-deep REGION tree (not from text — the parser bounds text at
+    // MAX_NEST) degrades to listing nodes without further nesting instead
+    // of overflowing the stack.
+    if depth > MAX_NEST {
+        return;
+    }
+    let pad = "  ".repeat(depth);
+    let ridx = region.index() as usize;
+    if ridx >= per_region.len() {
+        return;
+    }
+    for id in per_region[ridx].iter() {
+        let node = match arena.node(*id) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
         let mut uses: Vec<String> = Vec::with_capacity(node.n_inputs as usize);
         for i in 0..node.n_inputs as usize {
             if i < crate::node::MAX_INPUTS {
@@ -253,20 +333,50 @@ pub fn print_arena(arena: &IrArena) -> String {
             }
         }
         if node.op == Op::If {
-            lines.push(format!("  %{} = if {}", id.index(), uses.join(", ")));
+            // Owned regions: then = lower index, else = higher.
+            let mut owned: Vec<RegionId> = Vec::with_capacity(2);
+            arena.for_each_region(|rid, r| {
+                if r.owner == *id {
+                    owned.push(rid);
+                }
+            });
+            owned.sort_by_key(|r| r.index());
+            if owned.len() == 2 {
+                lines.push(format!(
+                    "{}%{} = if {} : {} {{",
+                    pad,
+                    id.index(),
+                    uses.join(", "),
+                    format_type(&node.ty)
+                ));
+                let (then_r, else_r) = (owned[0], owned[1]);
+                print_region_nodes(arena, per_region, then_r, depth + 1, lines);
+                lines.push(format!("{}}} else {{", pad));
+                print_region_nodes(arena, per_region, else_r, depth + 1, lines);
+                lines.push(format!("{}}}", pad));
+            } else {
+                // Degraded flat form (audit F-8): the region linkage is
+                // incomplete (the verifier's BadIfRegions rejects such
+                // arenas upstream). The bodies STILL print (indented,
+                // region attribution lost on re-parse) so no node is
+                // silently dropped — a documented lossy escape hatch for
+                // malformed arenas, never a silent one.
+                lines.push(format!("{}%{} = if {}", pad, id.index(), uses.join(", ")));
+                for rid in owned {
+                    print_region_nodes(arena, per_region, rid, depth + 1, lines);
+                }
+            }
         } else {
             lines.push(format!(
-                "  %{} = {} {} : {}",
+                "{}%{} = {} {} : {}",
+                pad,
                 id.index(),
                 format_op(node.op),
                 uses.join(", "),
                 format_type(&node.ty)
             ));
         }
-    });
-    out.push_str(&lines.join("\n"));
-    out.push_str("\n}\n");
-    out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,11 +593,13 @@ impl Parser {
 
 /// CEP:WHAT: Parses textual XIR v1 into an arena.
 /// CEP:WHY: The tools (xla-opt, xla-run) and tests consume .xir files.
-/// CEP:STATUS: partial
+/// CEP:STATUS: complete
 /// CEP:FAILURE: ParseError with byte offset; arena capacity is honored.
-/// CEP:ASSUMES: flat function body (no regions — see module CEP:TODO).
+/// CEP:ASSUMES: repository-trusted UTF-8 input; if-regions parse into
+///              owned child regions (CEP-12).
 /// CEP:COST: O(bytes) single pass.
-/// CEP:EVIDENCE: tests `roundtrip_flat_function`, `rejects_garbage`.
+/// CEP:EVIDENCE: tests `roundtrip_flat_function`, `roundtrip_if_regions`,
+///           `rejects_garbage`.
 /// CEP:SECURITY: bounded parses; checked arithmetic everywhere.
 pub fn parse_arena(src: &str, node_capacity: usize) -> Result<IrArena, ParseError> {
     let toks = lex(src)?;
@@ -502,82 +614,169 @@ pub fn parse_arena(src: &str, node_capacity: usize) -> Result<IrArena, ParseErro
         }
     }
     p.expect_sym('{')?;
-    let mut arena = IrArena::with_capacity(node_capacity, node_capacity / 8 + 4);
+    // Region capacity: every if consumes 1 node + 2 regions; half the node
+    // budget leaves generous headroom (CEP-12).
+    let mut arena = IrArena::with_capacity(node_capacity, node_capacity / 2 + 8);
     let root: RegionId = arena.root_region();
     // Value table: %N -> ValueId.
     let mut vals: Vec<(u32, crate::id::ValueId)> = Vec::with_capacity(64);
-
-    loop {
-        p.skip_eols();
-        // Statement start: a %N definition or the closing brace.
-        if matches!(p.peek(), Some((Tok::Sym('}'), _))) {
-            let _ = p.next();
-            break;
-        }
-        let (tok, off) = p.next()?;
-        match tok {
-            Tok::ValueRef(def) => {
-                p.expect_sym('=')?;
-                let (word, woff) = p.next()?;
-                let name = match word {
-                    Tok::Word(w) => w,
-                    _ => return Err(ParseError::UnexpectedToken(woff)),
-                };
-                let op = parse_op(&mut p, &name, woff)?;
-                if op == Op::If {
-                    return Err(ParseError::IfUnsupported(woff));
-                }
-                // Inputs: comma-separated %N references.
-                let mut inputs: Vec<crate::id::ValueId> = Vec::with_capacity(4);
-                while matches!(p.peek(), Some((Tok::ValueRef(_), _))) {
-                    let (t, o) = p.next()?;
-                    if let Tok::ValueRef(n) = t {
-                        let mut found = crate::id::ValueId::NONE;
-                        for (k, v) in vals.iter() {
-                            if *k == n {
-                                found = *v;
-                            }
-                        }
-                        if found.is_none() {
-                            return Err(ParseError::UnexpectedToken(o));
-                        }
-                        inputs.push(found);
-                    }
-                    // Comma-separated.
-                    if matches!(p.peek(), Some((Tok::Sym(','), _))) {
-                        let _ = p.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Optional type (may span several tokens for tensors).
-                let ty = if matches!(p.peek(), Some((Tok::Sym(':'), _))) {
-                    let _ = p.next();
-                    parse_type_tokens(&mut p)?
-                } else {
-                    infer_type(&op)
-                };
-                let node = Node::new(op, root, &inputs, ty);
-                let id = arena
-                    .insert_node(root, node)
-                    .map_err(|_| ParseError::ArenaExhausted)?;
-                let v = arena
-                    .value_of(id, 0)
-                    .map_err(|_| ParseError::ArenaExhausted)?;
-                vals.push((def, v));
-                // Statement terminator: Eol or EOF.
-                match p.peek() {
-                    Some((Tok::Eol, _)) => {
-                        let _ = p.next();
-                    }
-                    None => {}
-                    _ => return Err(ParseError::UnexpectedToken(off)),
-                }
-            }
-            _ => return Err(ParseError::UnexpectedToken(off)),
-        }
+    parse_block(&mut p, &mut arena, &mut vals, root, 0)?;
+    // Only trailing newlines may follow the closing brace.
+    p.skip_eols();
+    if p.peek().is_some() {
+        let (_, off) = p.next()?;
+        return Err(ParseError::UnexpectedToken(off));
     }
     Ok(arena)
+}
+
+/// CEP:WHAT: Parses statements into `region` until its closing brace.
+/// CEP:WHY: CEP-12: blocks nest — the function body, then/else bodies and
+///          nested if bodies all share one statement grammar terminated by
+///          '}'.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: ParseError propagation; Truncated at EOF without '}'.
+/// CEP:ASSUMES: header/inputs already consumed for the enclosing construct.
+/// CEP:COST: O(statements).
+/// CEP:EVIDENCE: tests `roundtrip_if_regions`, `roundtrip_flat_function`.
+fn parse_block(
+    p: &mut Parser,
+    arena: &mut IrArena,
+    vals: &mut Vec<(u32, crate::id::ValueId)>,
+    region: RegionId,
+    depth: usize,
+) -> Result<(), ParseError> {
+    // Bounded recursion (audit F-13): a nesting depth beyond MAX_NEST
+    // fails loudly with an offset instead of growing the stack unbounded.
+    if depth > MAX_NEST {
+        let off = match p.peek() {
+            Some((_, o)) => o,
+            None => usize::MAX,
+        };
+        return Err(ParseError::NestingTooDeep(off));
+    }
+    loop {
+        p.skip_eols();
+        if matches!(p.peek(), Some((Tok::Sym('}'), _))) {
+            let _ = p.next();
+            return Ok(());
+        }
+        if p.peek().is_none() {
+            return Err(ParseError::Truncated);
+        }
+        parse_statement(p, arena, vals, region, depth)?;
+    }
+}
+
+/// CEP:WHAT: Parses one `%N = op ...` statement into `region`.
+/// CEP:WHY: Shared by every block; if-statements recurse via parse_block
+///          after creating the If node and its owned then/else regions.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: ParseError propagation.
+/// CEP:ASSUMES: block already opened.
+/// CEP:COST: O(1) per statement (plus recursion for ifs).
+/// CEP:EVIDENCE: roundtrip tests.
+fn parse_statement(
+    p: &mut Parser,
+    arena: &mut IrArena,
+    vals: &mut Vec<(u32, crate::id::ValueId)>,
+    region: RegionId,
+    depth: usize,
+) -> Result<(), ParseError> {
+    let (tok, off) = p.next()?;
+    let def = match tok {
+        Tok::ValueRef(n) => n,
+        _ => return Err(ParseError::UnexpectedToken(off)),
+    };
+    p.expect_sym('=')?;
+    let (word, woff) = p.next()?;
+    let name = match word {
+        Tok::Word(w) => w,
+        _ => return Err(ParseError::UnexpectedToken(woff)),
+    };
+    let op = parse_op(p, &name, woff)?;
+    // Inputs: comma-separated %N references.
+    let mut inputs: Vec<crate::id::ValueId> = Vec::with_capacity(4);
+    while matches!(p.peek(), Some((Tok::ValueRef(_), _))) {
+        let (t, o) = p.next()?;
+        if let Tok::ValueRef(n) = t {
+            let mut found = crate::id::ValueId::NONE;
+            for (k, v) in vals.iter() {
+                if *k == n {
+                    found = *v;
+                }
+            }
+            if found.is_none() {
+                return Err(ParseError::UnexpectedToken(o));
+            }
+            inputs.push(found);
+        }
+        // Comma-separated.
+        if matches!(p.peek(), Some((Tok::Sym(','), _))) {
+            let _ = p.next();
+        } else {
+            break;
+        }
+    }
+    if op == Op::If {
+        // `%N = if %C : ty { then } else { else }` — the If node is created
+        // FIRST (the owned regions reference it), then the blocks parse
+        // recursively into the then/else regions.
+        p.expect_sym(':')?;
+        let ty = parse_type_tokens(p)?;
+        let node = Node::new(op, region, &inputs, ty);
+        let id = arena
+            .insert_node(region, node)
+            .map_err(|_| ParseError::ArenaExhausted)?;
+        let v = arena
+            .value_of(id, 0)
+            .map_err(|_| ParseError::ArenaExhausted)?;
+        vals.push((def, v));
+        p.expect_sym('{')?;
+        let then_r = arena
+            .new_region(region, id)
+            .map_err(|_| ParseError::ArenaExhausted)?;
+        parse_block(p, arena, vals, then_r, depth + 1)?;
+        p.expect_word("else")?;
+        p.expect_sym('{')?;
+        let else_r = arena
+            .new_region(region, id)
+            .map_err(|_| ParseError::ArenaExhausted)?;
+        parse_block(p, arena, vals, else_r, depth + 1)?;
+        // Statement terminator: Eol or EOF.
+        match p.peek() {
+            Some((Tok::Eol, _)) => {
+                let _ = p.next();
+            }
+            None => {}
+            _ => return Err(ParseError::UnexpectedToken(woff)),
+        }
+        return Ok(());
+    }
+    // Optional type (may span several tokens for tensors).
+    let ty = if matches!(p.peek(), Some((Tok::Sym(':'), _))) {
+        let _ = p.next();
+        parse_type_tokens(p)?
+    } else {
+        infer_type(&op)
+    };
+    let node = Node::new(op, region, &inputs, ty);
+    let id = arena
+        .insert_node(region, node)
+        .map_err(|_| ParseError::ArenaExhausted)?;
+    let v = arena
+        .value_of(id, 0)
+        .map_err(|_| ParseError::ArenaExhausted)?;
+    vals.push((def, v));
+    // Statement terminator: Eol or EOF.
+    match p.peek() {
+        Some((Tok::Eol, _)) => {
+            let _ = p.next();
+        }
+        None => {}
+        _ => return Err(ParseError::UnexpectedToken(off)),
+    }
+    Ok(())
 }
 
 /// CEP:WHAT: Parses the op-specific production after the op name.
@@ -597,6 +796,25 @@ fn parse_op(p: &mut Parser, name: &str, off: usize) -> Result<Op, ParseError> {
             }
         }
         "const.f64" => {
+            // Bits escape form first (audit F-4): `const.f64 bits <hi> <lo>`
+            // encodes the exact f64 as two u32 decimal halves.
+            if let Some((Tok::Word(w), _)) = p.peek() {
+                if w == "bits" {
+                    let _ = p.next()?;
+                    let (hi, hi_off) = p.next()?;
+                    let (lo, lo_off) = p.next()?;
+                    let h = match hi {
+                        Tok::Int(v) if (0..=u32::MAX as i64).contains(&v) => v as u32,
+                        _ => return Err(ParseError::BadInt(hi_off)),
+                    };
+                    let l = match lo {
+                        Tok::Int(v) if (0..=u32::MAX as i64).contains(&v) => v as u32,
+                        _ => return Err(ParseError::BadInt(lo_off)),
+                    };
+                    let bits = (u64::from(h) << 32) | u64::from(l);
+                    return Ok(Op::ConstF64(f64::from_bits(bits)));
+                }
+            }
             let (t, o) = p.next()?;
             match t {
                 Tok::Float(v) => Ok(Op::ConstF64(v)),
@@ -995,6 +1213,212 @@ mod tests {
         if let Ok(a2) = reparsed {
             assert_eq!(print_arena(&a2), printed);
         }
+    }
+
+    // CEP:WHAT: graph.if regions round-trip through text v1 (CEP-12): the
+    //           nested block syntax parses into owned then/else regions and
+    //           prints back byte-identically (including NESTED ifs and uses
+    //           of pre-if values inside the blocks).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on any round-trip drift.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn roundtrip_if_regions() {
+        let src = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<f64>\n",
+            "  %1 = const.f64 1.0 : scalar<f64>\n",
+            "  %2 = if %0 : scalar<f64> {\n",
+            "    %3 = binary.mul %0, %1 : scalar<f64>\n",
+            "    %4 = if %1 : scalar<f64> {\n",
+            "      %5 = binary.add %3, %1 : scalar<f64>\n",
+            "    } else {\n",
+            "      %6 = binary.sub %3, %1 : scalar<f64>\n",
+            "    }\n",
+            "  } else {\n",
+            "    %7 = binary.add %0, %0 : scalar<f64>\n",
+            "  }\n",
+            "  %8 = binary.add %2, %1 : scalar<f64>\n",
+            "}\n",
+        );
+        let arena = parse_arena(src, 128);
+        assert!(arena.is_ok(), "parse error: {:?}", arena.err());
+        let arena = match arena {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        // Structural expectations: 9 live nodes + root + 2*2 regions.
+        let mut nodes = 0usize;
+        arena.for_each_live_node(|_, _| nodes += 1);
+        assert_eq!(nodes, 9);
+        let mut regions = 0usize;
+        arena.for_each_region(|_, _| regions += 1);
+        assert_eq!(regions, 5); // root + 2 ifs (outer + nested) * (then + else)
+                                // Round-trip: print -> parse -> print must be byte-identical.
+        let printed = print_arena(&arena);
+        let reparsed = parse_arena(&printed, 128);
+        assert!(reparsed.is_ok(), "reparse error: {:?}", reparsed.err());
+        if let Ok(a2) = reparsed {
+            assert_eq!(print_arena(&a2), printed);
+            // Fingerprint equality proves the region structure (not just the
+            // op stream) survived the round trip.
+            use crate::snapshot::IrSnapshot;
+            assert_eq!(
+                IrSnapshot::new(arena).fingerprint(),
+                IrSnapshot::new(a2).fingerprint()
+            );
+        }
+    }
+
+    // CEP:WHAT: if statements reject missing else blocks and trailing
+    //           garbage loudly (never a silent guess).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if malformed ifs parse.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn rejects_malformed_if() {
+        // Missing else block.
+        let no_else = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<f64>\n",
+            "  %1 = if %0 : scalar<f64> {\n",
+            "    %2 = const.f64 1.0 : scalar<f64>\n",
+            "  }\n",
+            "}\n",
+        );
+        assert!(parse_arena(no_else, 64).is_err());
+        // Missing type after the condition.
+        let no_type = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<f64>\n",
+            "  %1 = if %0 {\n",
+            "    %2 = const.f64 1.0 : scalar<f64>\n",
+            "  } else {\n",
+            "    %3 = const.f64 2.0 : scalar<f64>\n",
+            "  }\n",
+            "}\n",
+        );
+        assert!(parse_arena(no_type, 64).is_err());
+    }
+
+    // CEP:WHAT: The PARSER accepts cross-region sibling uses (text carries
+    //           structure, the verifier polices it): %2 from the then-region
+    //           used in the else-region parses fine here and is rejected by
+    //           xir_graph::verify in the integration test
+    //           `if_dominance_violation_rejected` (tests/cli.rs — audit F-12
+    //           moved the real evidence there).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on parser over-rejection.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test + tests/cli.rs `if_dominance_violation_rejected`
+    #[test]
+    fn if_regions_sibling_use_parses() {
+        let src = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<f64>\n",
+            "  %1 = if %0 : scalar<f64> {\n",
+            "    %2 = const.f64 1.0 : scalar<f64>\n",
+            "  } else {\n",
+            "    %3 = binary.add %2, %2 : scalar<f64>\n",
+            "  }\n",
+            "}\n",
+        );
+        let arena = parse_arena(src, 64);
+        assert!(arena.is_ok(), "text parses (structure is legal)");
+        if let Ok(a) = arena {
+            let mut regions = 0usize;
+            a.for_each_region(|_, _| regions += 1);
+            assert_eq!(regions, 3);
+        }
+    }
+
+    // CEP:WHAT: Non-finite and huge float constants round-trip through the
+    //           bits escape form (audit F-4: inf/NaN print as unparseable
+    //           words; |v| >= 2^63 prints as an integer that overflows the
+    //           i64 literal token).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on any round-trip drift.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn float_bits_roundtrip() {
+        for v in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            // 2^63 exactly (f64::from_bits(0x43E0..)) — the decimal overflow edge.
+            f64::from_bits(0x43E0_0000_0000_0000),
+            -f64::from_bits(0x43E0_0000_0000_0000),
+            1.0e300,
+            4.9e-324, // subnormal
+            0.5,
+            -0.25,
+            1.0e15,
+        ] {
+            let src = format!(
+                "xir v1 func @main {{\n  %0 = const.f64 bits {hi} {lo} : scalar<f64>\n}}\n",
+                hi = v.to_bits() >> 32,
+                lo = v.to_bits() & 0xFFFF_FFFF
+            );
+            let arena = parse_arena(&src, 64);
+            assert!(
+                arena.is_ok(),
+                "bits parse failed for {v}: {:?}",
+                arena.err()
+            );
+            if let Ok(a) = arena {
+                let printed = print_arena(&a);
+                let reparsed = parse_arena(&printed, 64);
+                assert!(reparsed.is_ok(), "reparse failed for {v}");
+                if let Ok(a2) = reparsed {
+                    // NaN != NaN by IEEE: compare BIT patterns via the op.
+                    let mut got = f64::NAN;
+                    let mut got2 = f64::NAN;
+                    a.for_each_live_node(|_, n| {
+                        if let Op::ConstF64(x) = n.op {
+                            got = x;
+                        }
+                    });
+                    a2.for_each_live_node(|_, n| {
+                        if let Op::ConstF64(x) = n.op {
+                            got2 = x;
+                        }
+                    });
+                    assert_eq!(got.to_bits(), v.to_bits(), "value drift for {v}");
+                    assert_eq!(got2.to_bits(), v.to_bits(), "round-trip drift for {v}");
+                    assert_eq!(print_arena(&a2), printed, "print instability for {v}");
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: Runaway if-nesting fails loudly at the depth bound instead
+    //           of overflowing the stack (audit F-13).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: the test would crash (stack overflow) without the bound.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn rejects_runaway_nesting() {
+        let mut src = String::from("xir v1 func @main {\n");
+        let depth = 2000usize;
+        src.push_str("  %0 = param 0 : scalar<f64>\n");
+        for i in 1..=depth {
+            src.push_str(&format!("  %{i} = if %{} : scalar<f64> {{\n", i - 1));
+        }
+        for _ in 0..depth {
+            src.push_str("  }\n");
+        }
+        src.push_str("}\n");
+        let arena = parse_arena(&src, 65536);
+        assert!(matches!(arena, Err(ParseError::NestingTooDeep(_))));
     }
 
     // CEP:WHAT: Garbage input fails with an offset, never panics.

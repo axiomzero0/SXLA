@@ -26,12 +26,15 @@
 //!
 //! Partitioned equality saturation with fusion-aware extraction.
 
+pub mod apply;
 pub mod egraph;
 pub mod extract;
+pub(crate) mod lift;
 pub mod rules;
 pub mod saturate;
 pub mod union_find;
 
+pub use apply::{apply, ApplyOutcome};
 pub use egraph::{EGraph, EgraphError};
 pub use extract::{extract, Extraction, FUSION_LOCALITY_PENALTY};
 pub use saturate::saturate;

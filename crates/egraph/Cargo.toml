@@ -23,3 +23,4 @@ workspace = true
 [dependencies]
 anvil = { path = "../anvil" }
 xir-core = { path = "../xir-core" }
+xir-graph = { path = "../xir-graph" }

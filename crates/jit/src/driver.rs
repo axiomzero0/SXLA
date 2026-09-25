@@ -90,10 +90,18 @@ pub struct CompiledProgram {
 pub fn parse_and_verify(src: &str) -> Result<(Arc<IrSnapshot>, Vec<NodeId>), JitError> {
     let arena: IrArena = parse_arena(src, 4096).map_err(JitError::Parse)?;
     verify(&arena).map_err(JitError::Verify)?;
-    // Roots: the LAST live node is the function result (single-result v1
-    // text format; documented contract of the printer's emission order).
+    // Roots: the LAST live node OF THE ROOT REGION is the function result
+    // (single-result v1 text format). Audit F-11: the last SLOT overall is
+    // an else-BODY node when the program ends in an if (the parser inserts
+    // the If first, then the block statements) — the If's value is the
+    // result, and a root-region scan selects it.
+    let root = arena.root_region();
     let mut last = NodeId::NONE;
-    arena.for_each_live_node(|id, _| last = id);
+    arena.for_each_live_node(|id, node| {
+        if node.region == root {
+            last = id;
+        }
+    });
     let roots = if last.is_none() { vec![] } else { vec![last] };
     Ok((Arc::new(IrSnapshot::new(arena)), roots))
 }
@@ -140,9 +148,11 @@ pub fn compile(
                 roots.to_vec(),
             )));
             if tier == Tier::Tier2 {
-                // Tier 2: e-graph saturation (analysis + rewrite through the
-                // same snapshot-commit discipline) then the fusion search.
-                passes.push(Box::new(EgraphPass));
+                // Tier 2: e-graph saturation + extraction application
+                // (transactional, CEP-17) then the fusion search.
+                passes.push(Box::new(EgraphPass {
+                    roots: roots.to_vec(),
+                }));
             }
             let pm = PassManager::new(manifest, passes);
             match pm.run(&mut ctx, snap) {
@@ -170,8 +180,12 @@ pub fn compile(
     // level-3 tiling decisions; semantic equivalence is enforced by the
     // differential integration test).
     if tier == Tier::Tier2 {
+        // Fusion universe search (audit F-3: the outcome is analysis-only
+        // today — the ClusterSet does not yet feed project/lower, which is
+        // the CEP-22 gap; the ERROR is now propagated instead of swallowed).
         let arena = current.arena();
-        let _outcome = fusion::search::search(arena, anvil::default_worker_count().max(1));
+        let _analysis = fusion::search::search(arena, anvil::default_worker_count().max(1))
+            .map_err(|_| JitError::Pipeline("fusion-search"))?;
     }
     // Structurize + lower — FROM THE OPTIMIZED SNAPSHOT (audit F-3).
     let prog: LoopProgram =
@@ -196,22 +210,40 @@ pub fn compile_text(src: &str, tier: Tier) -> Result<CompiledProgram, JitError> 
     compile(&snap, &roots, tier)
 }
 
-/// Tier-2 e-graph pass (saturation; rewrite application is extraction-
-/// gated and currently telemetry-only — semantics identical, CEP-17).
-struct EgraphPass;
+/// Tier-2 e-graph pass (extraction application, CEP-17).
+///
+/// CEP:WHAT: EgraphPass — saturates the pure subgraph, extracts the
+///           cheapest program, and APPLIES the selected rewrites through
+///           the transactional clone-mutate-verify-publish discipline.
+/// CEP:WHY: Architecture section 4: saturation discovers equalities,
+///          extraction selects, application lands the rewrites in the IR.
+///          Until v2 this pass was analysis-only (ReadOnly, results
+///          discarded) — the audit's "dead analysis" gap.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: PipelineError::PassFailed on saturation failure;
+///              VerifyFailed on post-application verification.
+/// CEP:ASSUMES: verified, canonicalized input (manifest order runs
+///              canonicalize-l0 first).
+/// CEP:COST: saturation + extraction + application (see egraph::apply).
+/// CEP:EVIDENCE: jit driver tier-2 divergence test (instruction count
+///           drops below Tier-1 while values agree differentially).
+struct EgraphPass {
+    /// Function result nodes anchoring the closing DCE sweep.
+    roots: Vec<NodeId>,
+}
 
 impl xir_levels::passman::Pass for EgraphPass {
     fn name(&self) -> &'static str {
-        "egraph-saturate"
+        "egraph-apply"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn required_form(&self) -> xir_levels::passman::IrFormPreference {
         xir_levels::passman::IrFormPreference::Graph
     }
     fn concurrency(&self) -> xir_levels::passman::PassConcurrency {
-        xir_levels::passman::PassConcurrency::ReadOnly
+        xir_levels::passman::PassConcurrency::Transactional
     }
     fn hpc_class(&self) -> xir_levels::passman::HpcClass {
         xir_levels::passman::HpcClass::Hpc0
@@ -224,11 +256,22 @@ impl xir_levels::passman::Pass for EgraphPass {
         _ctx: &mut WorkerContext<'_>,
         ir: &Arc<IrSnapshot>,
     ) -> Result<PassOutput, xir_levels::passman::PipelineError> {
-        let _result = egraph::saturate::saturate(ir.arena(), 8192);
-        // Saturation is analysis + candidate rewrites; applying extracted
-        // rewrites to the snapshot is the CEP-17 extension. The pass stays
-        // ReadOnly: it changes nothing until extraction application lands.
-        Ok(PassOutput::Unchanged)
+        // Clone-mutate-verify-publish (transactional boundary).
+        let mut working: IrArena = ir.arena().deep_clone();
+        let outcome = egraph::apply::apply(&mut working, &self.roots, 8192)
+            .map_err(|_| xir_levels::passman::PipelineError::PassFailed(self.name()))?;
+        if outcome.rewrites_applied == 0 {
+            return Ok(PassOutput::Unchanged);
+        }
+        // Verify before publication (commit contract; the pass manager
+        // re-verifies HPC-0 passes as well — both gates run).
+        if let Err(e) = verify(&working) {
+            return Err(xir_levels::passman::PipelineError::VerifyFailed(
+                self.name(),
+                e,
+            ));
+        }
+        Ok(PassOutput::Changed(Arc::new(IrSnapshot::new(working))))
     }
 }
 
@@ -329,5 +372,74 @@ mod tests {
         assert!(matches!(bad, Err(JitError::Parse(_))));
         let t3 = compile_text(SRC, Tier::Tier3);
         assert_eq!(t3.err(), Some(JitError::Pipeline("tier3-pgo-unavailable")));
+    }
+
+    // Integer identity: param + 0 survives Tier 1 (fold needs both operands
+    // constant) but the Tier-2 e-graph eliminates it (saturation discovers
+    // x+0 == x; extraction selects the operand; application rewires the
+    // consumer) — tiers MUST diverge in instruction count while agreeing on
+    // values (CEP-17 closing regression).
+    // CEP:WHAT: Tier-2 e-graph application optimizes beyond Tier-1.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the identity is not eliminated or if
+    //               values diverge.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn tier2_egraph_identity_diverges_from_tier1() {
+        const SRC2: &str = "xir v1 func @main {\n  %0 = param 0\n  %1 = const.i64 0\n  %2 = binary.add %0, %1\n  %3 = const.i64 7\n  %4 = binary.mul %2, %3\n}\n";
+        let t1 = compile_text(SRC2, Tier::Tier1);
+        let t2 = compile_text(SRC2, Tier::Tier2);
+        assert!(t1.is_ok() && t2.is_ok());
+        if let (Ok(a), Ok(b)) = (t1, t2) {
+            // Tier 1: const-zero + add + const-7 + mul = 4 instrs (params
+            // are function arguments, not instructions; no fold — param is
+            // not constant; no GVN — no duplicates).
+            // Tier 2: e-graph eliminates x+0 -> x, DCE drops the dead zero
+            // and add: const-7 + mul = 2 instrs.
+            assert_eq!(a.target.instrs.len(), 4);
+            assert_eq!(b.target.instrs.len(), 2);
+            // Differential values: (5 + 0) * 7 == 5 * 7 == 35.
+            use runtime::interp::execute;
+            use runtime::value::Value;
+            let va = execute(&a.target, &[Value::I64(5)]);
+            let vb = execute(&b.target, &[Value::I64(5)]);
+            assert!(va.is_ok() && vb.is_ok());
+            if let (Ok(xa), Ok(xb)) = (va, vb) {
+                assert_eq!(xa[0], Value::I64(35));
+                assert_eq!(xb[0], Value::I64(35));
+            }
+        }
+    }
+
+    // Float identity: param(f64) + 0.0 must survive EVERY tier (38.24
+    // signed-zero discipline — x + 0.0 differs from x at x = -0.0).
+    // CEP:WHAT: The e-graph never eliminates float zero identities.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the float identity is eliminated.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn tier2_preserves_float_zero_identity() {
+        const SRC3: &str = "xir v1 func @main {\n  %0 = param 0\n  %1 = const.f64 0.0\n  %2 = binary.add %0, %1\n}\n";
+        let t1 = compile_text(SRC3, Tier::Tier1);
+        let t2 = compile_text(SRC3, Tier::Tier2);
+        assert!(t1.is_ok() && t2.is_ok());
+        if let (Ok(a), Ok(b)) = (t1, t2) {
+            assert_eq!(a.target.instrs.len(), b.target.instrs.len());
+            // Differential: -0.0 + 0.0 == +0.0 (NOT -0.0) at both tiers.
+            use runtime::interp::execute;
+            use runtime::value::Value;
+            let va = execute(&a.target, &[Value::F64(-0.0)]);
+            let vb = execute(&b.target, &[Value::F64(-0.0)]);
+            assert!(va.is_ok() && vb.is_ok());
+            if let (Ok(xa), Ok(xb)) = (va, vb) {
+                let expect = Value::F64(-0.0 + 0.0);
+                assert_eq!(xa[0], expect);
+                assert_eq!(xb[0], expect);
+            }
+        }
     }
 }

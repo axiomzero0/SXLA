@@ -77,6 +77,27 @@ fn main() {
         h.write_u64(0xABCD_EF01_2345_6789);
         std::hint::black_box(h.finish());
     });
+    // CEP-3 (Law 4 evidence): region setup cost — scoped spawns vs the
+    // persistent pool, over MANY small Gear-1 regions. This is the exact
+    // workload shape of per-round e-graph saturation and fusion universe
+    // scoring (dozens of tiny regions per compilation).
+    {
+        let inputs: Vec<u64> = (0..256).collect();
+        let mut outputs: Vec<u64> = vec![0; 256];
+        let workers = anvil::default_worker_count().max(1);
+        bench_ns_per_op("region_scoped", 2_000, || {
+            let _ = anvil::run_partitioned_scoped(&inputs, &mut outputs, workers, |x| {
+                x.wrapping_mul(3)
+            });
+            std::hint::black_box(outputs[255]);
+        });
+        bench_ns_per_op("region_pooled", 2_000, || {
+            let _ = anvil::run_partitioned_pooled(&inputs, &mut outputs, workers, |x| {
+                x.wrapping_mul(3)
+            });
+            std::hint::black_box(outputs[255]);
+        });
+    }
     println!("done.");
 }
 

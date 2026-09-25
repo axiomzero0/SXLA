@@ -30,7 +30,11 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | E-graph union-find (order-independent) | complete | union_find/egraph tests |
 | Rewrite legality gates (38.24 float ban) | complete | rules tests |
 | Fusion-aware extraction penalties | complete | extract tests |
-| Saturation (Gear-1 local rules) | complete | saturate tests |
+| Saturation (Gear-1 local rules, pooled) | complete | saturate tests |
+| E-graph extraction application (CEP-17) | complete | apply tests + jit tier-2 differential |
+| Persistent worker pool (CEP-3) | complete | pool tests; bench 1.7us vs 53.7us region setup |
+| If-region text round-trip (CEP-12) | complete | text/verifier if-region tests |
+| Conv reference kernel (CEP-26) | complete | conv_valid/same/stride/multichannel tests |
 | Fusion legality (affine subset) | partial | legality tests; full Presburger = CEP-19 |
 | Resource model + repair | complete | resource/repair tests |
 | Tiered cost model | partial | Tier 1 complete; Tier 2 placeholder; Tier 3 loud stub (CEP-20/21) |
@@ -44,11 +48,8 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 
 | Item | Status | Ticket |
 |------|--------|--------|
-| graph.if regions in text v1 | partial (flat functions only) | CEP-12 |
-| Persistent worker pool (vs scoped regions) | partial | CEP-3 |
 | NUMA-aware allocation | placeholder | CEP-2 |
-| E-graph cross-worker SPSC merges | partial (Gear-1 local rules now) | CEP-17 |
-| Extraction application to snapshots | partial (analysis + telemetry) | CEP-17 |
+| E-graph cross-worker SPSC merges | partial (Gear-1 pooled local rules now) | CEP-17 |
 | Presburger/ISL legality | partial (affine subset) | CEP-19 |
 | Tier-2 ML ranker | placeholder (Tier-1 fallback, reported) | CEP-20 |
 | Tier-3 autotuning | stub (loud failure) | CEP-21 |
@@ -58,8 +59,43 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Shared-memory promotion | partial (budgets + spaces) | CEP-24 |
 | GPU targets | placeholder (CPU only, loud) | CEP-16 |
 | Strided/block layouts | placeholder | CEP-7 |
-| Conv interpreter kernel | stub (UnsupportedInstr, loud) | CEP-26 |
+| Conv interpreter kernel | complete (naive NCHW/FCHW reference; valid/same/stride) | closed |
 | CI sanitizer matrix | partial (workflow present; nightly TSan gated) | CEP-27 |
+
+## Second audit round (session 2) and remediation
+
+A second standards audit over the four new features (egraph apply/lift,
+pool, text if-regions, conv kernel, driver) found 0 S0, 3 S1, 10 S2. All
+were remediated with regression tests:
+
+- **S1-1 (panic)**: `run_partitioned_scoped` panicked on empty inputs
+  (`chunks(0)`); both routing paths now no-op (`gear1_empty_inputs_are_noop`).
+- **S1-2 (deadlock hole)**: scoped-fallback workers did not carry the
+  in-region TLS flag, so nested pooled calls from a scoped worker inside a
+  pooled enclosing region could self-deadlock; the flag is now set on every
+  scoped worker (`set_in_region_scoped`).
+- **S1-3 (swallowed failure + dead stage)**: Tier-2's fusion search
+  discarded its Result and fed nothing downstream; the error now propagates
+  (`JitError::Pipeline("fusion-search")`) and the docs state the ClusterSet
+  does not yet feed structurize (CEP-22).
+- S2s: float bits escape form for non-finite/oversized constants
+  (`float_bits_roundtrip`); EGraph::merge canonicalizes both arguments;
+  provable folds fire when the folded const dedups onto an existing arena
+  constant (`apply_folds_when_const_dedups`); conv Valid rejects oversized
+  kernels (`conv_valid_oversized_kernel_rejected`); degraded if-form
+  printing keeps body nodes; check-in notifies exactly once per region;
+  stale executor header corrected; roots = last ROOT-region node
+  (`if_program_fails_loudly_at_lowering`); text-level dominance rejection
+  moved to the integration crate (`if_dominance_violation_rejected`);
+  parser/print nesting bounded at MAX_NEST (`rejects_runaway_nesting`).
+- Remediation itself found and fixed a flag-loss bug: the helper-side
+  job-panic signal was discarded when `run_caught` swallowed the
+  trampoline's saw-panic return value (flaky `pool_panicking_job_reported
+  _loudly`); both panic channels now combine.
+
+The pool's lending discipline (the audit's focus area A) was certified
+airtight across publish/trampoline/check-in/reap interleavings, panic
+paths, Drop ordering, and hint/authority races.
 
 ## Waivers
 

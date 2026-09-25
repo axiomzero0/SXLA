@@ -213,10 +213,10 @@ mod tests {
     fn ancestor_dominates() {
         let mut a = IrArena::with_capacity(8, 16);
         let root = a.root_region();
-        let child = a.new_region(root);
+        let child = a.new_region(root, xir_core::id::NodeId::NONE);
         assert!(child.is_ok());
         let grandchild = match child {
-            Ok(c) => a.new_region(c),
+            Ok(c) => a.new_region(c, xir_core::id::NodeId::NONE),
             Err(_) => return,
         };
         let dt = DominatorTree::build(&a);
@@ -239,8 +239,8 @@ mod tests {
     fn disjoint_regions_dont() {
         let mut a = IrArena::with_capacity(8, 16);
         let root = a.root_region();
-        let c1 = a.new_region(root);
-        let c2 = a.new_region(root);
+        let c1 = a.new_region(root, xir_core::id::NodeId::NONE);
+        let c2 = a.new_region(root, xir_core::id::NodeId::NONE);
         let dt = DominatorTree::build(&a);
         assert!(dt.is_ok());
         if let (Ok(r1), Ok(r2), Ok(tree)) = (c1, c2, dt) {

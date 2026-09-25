@@ -52,18 +52,25 @@ pub enum ArenaError {
 ///
 /// CEP:WHAT: One node of the control tree (body / then / else / loop).
 /// CEP:WHY: graph.if region nodes (arch Level 0) and Level-3 loop nests both
-///          structure control via this tree; children nest by id.
+///          structure control via this tree; children nest by id. The
+///          `owner` field makes the If->(then, else) linkage EXPLICIT
+///          (CEP-12): an owned region belongs to the If node that spawned
+///          it; the lower-index owned region is `then`, the higher is
+///          `else` (creation-order convention, checked by the verifier).
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none (arena validates).
-/// CEP:ASSUMES: parent NONE marks the root region.
+/// CEP:ASSUMES: parent NONE marks the root region; owner NONE marks
+///              unowned structural regions (root, loop bodies).
 /// CEP:COST: 24 bytes.
-/// CEP:EVIDENCE: test `region_tree`.
+/// CEP:EVIDENCE: test `region_tree`, text if-region round-trip tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     /// Parent region (NONE for root).
     pub parent: RegionId,
     /// First node in this region's intrusive list.
     pub first_node: NodeId,
+    /// Owning If node (NONE for unowned regions).
+    pub owner: NodeId,
     /// Monotonic slot generation for id reuse detection.
     pub generation: u16,
 }
@@ -115,7 +122,7 @@ impl IrArena {
             root: RegionId::NONE,
         };
         // Root region at slot 0, generation 0.
-        if let Ok(root) = arena.new_region(RegionId::NONE) {
+        if let Ok(root) = arena.new_region(RegionId::NONE, NodeId::NONE) {
             arena.root = root;
         }
         arena
@@ -133,13 +140,15 @@ impl IrArena {
     }
 
     /// CEP:WHAT: Creates a child region.
-    /// CEP:WHY: graph.if then/else bodies, loop bodies (arch regions).
+    /// CEP:WHY: graph.if then/else bodies (owner = the If node, CEP-12),
+    ///          loop bodies (owner = NONE).
     /// CEP:STATUS: complete
     /// CEP:FAILURE: Exhausted when region capacity is full.
-    /// CEP:ASSUMES: parent exists or is NONE (root's parent).
+    /// CEP:ASSUMES: parent exists or is NONE (root's parent); owner is a
+    ///              live node in `parent` or NONE.
     /// CEP:COST: append or free-pop; O(1).
-    /// CEP:EVIDENCE: test `region_tree`.
-    pub fn new_region(&mut self, parent: RegionId) -> Result<RegionId, ArenaError> {
+    /// CEP:EVIDENCE: test `region_tree`, text if-region round-trip tests.
+    pub fn new_region(&mut self, parent: RegionId, owner: NodeId) -> Result<RegionId, ArenaError> {
         if self.regions.len() >= self.regions.capacity() {
             return Err(ArenaError::Exhausted);
         }
@@ -160,16 +169,35 @@ impl IrArena {
             self.regions.push(Region {
                 parent,
                 first_node: NodeId::NONE,
+                owner,
                 generation,
             });
         } else {
             self.regions[index as usize] = Region {
                 parent,
                 first_node: NodeId::NONE,
+                owner,
                 generation,
             };
         }
         Ok(RegionId::pack(index, generation))
+    }
+
+    /// CEP:WHAT: Iterates every region slot with a live handle.
+    /// CEP:WHY: The text printer resolves an If node's owned then/else
+    ///          regions (CEP-12) and the verifier checks owner linkage;
+    ///          regions are never freed in v1, so slot order is stable.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: none (read-only callback).
+    /// CEP:ASSUMES: callback does not mutate the arena (no aliasing —
+    ///              &self borrow enforces it).
+    /// CEP:COST: O(region slots).
+    /// CEP:EVIDENCE: text if-region round-trip tests.
+    pub fn for_each_region(&self, mut f: impl FnMut(RegionId, &Region)) {
+        for idx in 0..self.regions.len() {
+            let id = RegionId::pack(idx as u32, self.regions[idx].generation);
+            f(id, &self.regions[idx]);
+        }
     }
 
     /// CEP:WHAT: Inserts a node into a region.
@@ -574,7 +602,7 @@ mod tests {
     fn region_tree() {
         let mut a = IrArena::with_capacity(8, 8);
         let root = a.root_region();
-        let then_r = a.new_region(root);
+        let then_r = a.new_region(root, NodeId::NONE);
         assert!(then_r.is_ok());
         let then_r = match then_r {
             Ok(v) => v,

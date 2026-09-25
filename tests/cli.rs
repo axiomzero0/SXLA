@@ -210,3 +210,64 @@ fn differential_fusion_equivalence() {
     // relu(7*2+1) = 15.
     assert!(r2.unwrap_or("").contains("15"));
 }
+
+// CEP:WHAT: Cross-region sibling use (then-value used in the else-region)
+//           PARSES but is REJECTED by the verifier (region dominance,
+//           38.18) — the text-level dominance evidence for CEP-12 that the
+//           xir-core suite cannot host (audit F-12).
+// CEP:STATUS: complete
+// CEP:FAILURE: assert fires if the dominance violation verifies.
+// CEP:ASSUMES: none
+// CEP:COST: test-only
+// CEP:EVIDENCE: this test
+#[test]
+fn if_dominance_violation_rejected() {
+    let src = concat!(
+        "xir v1 func @main {\n",
+        "  %0 = param 0 : scalar<f64>\n",
+        "  %1 = if %0 : scalar<f64> {\n",
+        "    %2 = const.f64 1.0 : scalar<f64>\n",
+        "  } else {\n",
+        "    %3 = binary.add %2, %2 : scalar<f64>\n",
+        "  }\n",
+        "}\n",
+    );
+    let arena = xir_core::text::parse_arena(src, 64);
+    assert!(arena.is_ok(), "parser accepts the structure");
+    if let Ok(a) = arena {
+        assert!(xir_graph::verifier::verify(&a).is_err());
+    }
+}
+
+// CEP:WHAT: A program ending in an if FAILS LOUDLY at target lowering
+//           (UnsupportedOp) — never silently wrong values. This also pins
+//           the root-set fix (audit F-11): the result root is the last
+//           ROOT-REGION node (the If), not the last else-body statement.
+// CEP:STATUS: complete
+// CEP:FAILURE: assert fires if the program compiles or panics.
+// CEP:ASSUMES: none
+// CEP:COST: test-only
+// CEP:EVIDENCE: this test
+#[test]
+fn if_program_fails_loudly_at_lowering() {
+    let src = concat!(
+        "xir v1 func @main {\n",
+        "  %0 = param 0 : scalar<f64>\n",
+        "  %1 = const.f64 1.0 : scalar<f64>\n",
+        "  %2 = if %0 : scalar<f64> {\n",
+        "    %3 = binary.mul %0, %1 : scalar<f64>\n",
+        "  } else {\n",
+        "    %4 = binary.add %0, %1 : scalar<f64>\n",
+        "  }\n",
+        "}\n",
+    );
+    let path = write_fixture("ifprog", src);
+    let (ok, out) = run_tool("xla-run", &["--tier", "0", "--input", "3", &path]);
+    // The run must fail loudly (If lowering is UnsupportedOp — CEP ticket),
+    // with a clear message, never a wrong result and never a crash.
+    assert!(!ok, "if-program must not execute: {out}");
+    assert!(
+        out.contains("failed") || out.contains("error") || out.contains("Error"),
+        "failure must be loud: {out}"
+    );
+}

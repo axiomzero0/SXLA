@@ -16,8 +16,9 @@
 //               unsafe blocks are bounded by checked indices and executor lifetime proofs.
 // CEP:HPC-CLASS: HPC-0 (lock-free fast paths), HPC-1 (thread orchestration)
 // CEP:HPC-DETERMINISM: deterministic; no hash-order or time dependence in any primitive.
-// CEP:TODO(main-agent): CEP-2: persistent park-based worker pool instead of scoped regions;
-//                       NUMA-aware allocation policies are a future extension of config.
+// CEP:TODO(main-agent): CEP-2: NUMA-aware allocation policies are a future
+//                       extension of config (the persistent pool landed as
+//                       pool.rs — CEP-3).
 //! # Anvil concurrency engine
 //!
 //! Module layout follows CEP&CC 32.2 hot/cold separation as closely as Rust crate
@@ -32,9 +33,16 @@ pub mod ebr;
 pub mod executor;
 pub mod fuel;
 pub mod pad;
+pub mod pool;
 pub mod sharded;
 pub mod spsc;
 pub mod telemetry;
 
 /// Re-exported gear entry points and shared types.
-pub use executor::{default_worker_count, run_fork_join, run_partitioned, Job, WorkerCtx};
+pub use executor::{
+    default_worker_count, run_fork_join, run_fork_join_scoped, run_partitioned,
+    run_partitioned_scoped, Job, WorkerCtx,
+};
+pub use pool::{
+    global_pool, in_pooled_region, run_fork_join_pooled, run_partitioned_pooled, Pool, PoolError,
+};

@@ -28,6 +28,7 @@ version = "0.1.0"
 dependencies = [
  "anvil",
  "xir-core",
+ "xir-graph",
 ]
 
 [[package]]
@@ -68,6 +69,7 @@ dependencies = [
  "jit",
  "runtime",
  "xir-core",
+ "xir-graph",
 ]
 
 [[package]]

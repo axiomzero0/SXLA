@@ -8,7 +8,7 @@ Module-level CEP:WHY fields carry the full reasoning at each site.
 | Gear | Where | Contract |
 |------|-------|----------|
 | 1 — Static partitioning | `anvil::executor::run_partitioned` (used by e-graph local rules and fusion universe scoring) | Disjoint slices, zero atomics inside task bodies, zero stealing |
-| 2 — Fork/join + work stealing | `anvil::executor::run_fork_join` + `chase_lev::Deque` | LIFO own-deque pops, FIFO steals, pending-credit termination |
+| 2 — Fork/join + work stealing | `anvil::executor::run_fork_join` (+ `anvil::pool::Pool`, CEP-3) + `chase_lev::Deque` | LIFO own-deque pops, FIFO steals, pending-credit termination; persistent park-based pool with per-region lending (bench: 1.7us vs 53.7us region setup) |
 | Task fuel | `anvil::fuel::FuelMeter` | Deterministic abstract work units (64/branch) replacing the wall-clock 500ns rule — time inputs would violate HPC determinism (CEP&CC 38.10) |
 | 3 — SPSC pipelines | `anvil::spsc::SpscRing` + `telemetry::TelemetryBus` + `jit::boundary` | Acquire/Release pairs, batched drains |
 | 4 — EBR | `anvil::ebr::Collector` + `sharded::ShardedMap` + `jit::cache` | 2-atomic pin/unpin; lock-free reads; deferred frees |

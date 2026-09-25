@@ -38,6 +38,8 @@ pub enum EgraphError {
     BadClass,
     /// Union-find failure (out of bounds).
     Union(UnionFindError),
+    /// The application driver's closing DCE sweep failed (apply path).
+    Dce,
 }
 
 /// One e-node: an op whose children are e-class ids.
@@ -163,9 +165,14 @@ impl EGraph {
     /// CEP:COST: O(members) move.
     /// CEP:EVIDENCE: test `merge_dedups_nodes`.
     pub fn merge(&mut self, a: u32, b: u32) -> Result<u32, EgraphError> {
-        let winner = self.uf.union(a, b).map_err(EgraphError::Union)?;
+        // Canonicalize BOTH arguments first (audit F-5): comparing the
+        // union-find root against a raw (possibly stale) argument corrupted
+        // the classes membership map when a stale id's root was the loser.
+        let ca = self.uf.find(a).map_err(EgraphError::Union)?;
+        let cb = self.uf.find(b).map_err(EgraphError::Union)?;
+        let winner = self.uf.union(ca, cb).map_err(EgraphError::Union)?;
         // Move members of the loser class into the winner's list.
-        let loser = if winner == a { b } else { a };
+        let loser = if winner == ca { cb } else { ca };
         if let Some(members) = self.classes.remove(&loser) {
             let entry = self.classes.entry(winner).or_default();
             for m in members {

@@ -288,8 +288,8 @@ mod tests {
     fn respects_dominance() {
         let mut a = IrArena::with_capacity(32, 8);
         let root = a.root_region();
-        let r1 = a.new_region(root);
-        let r2 = a.new_region(root);
+        let r1 = a.new_region(root, xir_core::id::NodeId::NONE);
+        let r2 = a.new_region(root, xir_core::id::NodeId::NONE);
         if let (Ok(reg1), Ok(reg2)) = (r1, r2) {
             let c0 = const_f64(&mut a, root, 1.0);
             if let Ok(v0) = c0 {

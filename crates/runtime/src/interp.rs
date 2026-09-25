@@ -13,14 +13,16 @@
 //           conv O(hw*cf*rr) — the correctness-first Tier-0 path
 //           (documented; Tier-1/2 codegen owns performance).
 // CEP:EVIDENCE: tests `scalar_arithmetic`, `tensor_elementwise`, `dot`,
-//           `reduce_axis`, `matmul_reference`, `rng_is_deterministic`.
+//           `reduce_axis`, `matmul_reference`, `rng_is_deterministic`,
+//           `conv_valid_reference`, `conv_same_zero_fill`,
+//           `conv_stride_reference`, `conv_multichannel_reference`.
 // CEP:SECURITY: slot bounds checked per instruction; allocation sized by
 //           verified types (no untrusted sizes reach here).
 // CEP:HPC-CLASS: HPC-0.
 // CEP:HPC-DETERMINISM: deterministic — fixed iteration order, seeded RNG.
 //! The reference interpreter.
 
-use xir_core::op::{Monoid, RngDist};
+use xir_core::op::{Monoid, Padding, RngDist};
 use xir_core::ty::Shape;
 use xir_levels::level4::{Instr, TargetProgram};
 
@@ -149,7 +151,13 @@ fn run_instr(table: &mut [Value], instr: &Instr) -> Result<(), RuntimeError> {
         }
         Instr::Transpose { dst, a } => transpose(table, *dst, *a),
         Instr::Rng { dst, seed, dist } => rng(table, *dst, *seed, *dist),
-        Instr::Conv { .. } => Err(RuntimeError::UnsupportedInstr),
+        Instr::Conv {
+            dst,
+            a,
+            b,
+            padding,
+            stride,
+        } => conv(table, *dst, *a, *b, *padding, *stride),
     }
 }
 
@@ -427,6 +435,113 @@ fn matmul(
         }
     }
     let shape = Shape::from_dims(&[m, n]).map_err(|_| RuntimeError::ShapeMismatch)?;
+    let d = table.get_mut(dst as usize).ok_or(RuntimeError::BadSlot)?;
+    *d = Value::Tensor { data: out, shape };
+    Ok(())
+}
+
+/// CEP:WHAT: Naive 2D convolution (NCHW input, FCHW filter).
+/// CEP:WHY: Tier-0 correctness kernel for tensor.conv (CEP-26 closing):
+///           the reference semantics every optimized convolution lowering
+///           must match differentially. Valid = no zero padding; Same =
+///           symmetric zero fill so output spatial dims are ceil(H/stride)
+///           and ceil(W/stride) (the extra odd pad pixel goes to the
+///           bottom/right — TF discipline, documented for differential
+///           agreement with any future tiled lowering).
+/// CEP:STATUS: complete
+/// CEP:FAILURE: ShapeMismatch for non-rank-4 operands, input/filter
+///              channel disagreement, zero stride, or non-positive
+///              output dims; UnsupportedValue for i64 tensors.
+/// CEP:ASSUMES: f64 row-major tensors.
+/// CEP:COST: O(N*F*OH*OW*C*KH*KW) — reference kernel, no tiling.
+/// CEP:EVIDENCE: tests `conv_valid_reference`, `conv_same_zero_fill`,
+///           `conv_stride_reference`, `conv_multichannel_reference`,
+///           `conv_shape_mismatch`.
+/// CEP:HPC-DETERMINISM: deterministic — fixed loop order.
+fn conv(
+    table: &mut [Value],
+    dst: u32,
+    a: u32,
+    b: u32,
+    padding: Padding,
+    stride: u8,
+) -> Result<(), RuntimeError> {
+    let (xa, sa) = (load_f64s(table, a)?, tensor_shape(table, a)?);
+    let (xb, sb) = (load_f64s(table, b)?, tensor_shape(table, b)?);
+    if sa.rank() != 4 || sb.rank() != 4 {
+        return Err(RuntimeError::ShapeMismatch);
+    }
+    if stride == 0 {
+        return Err(RuntimeError::ShapeMismatch);
+    }
+    let stride = i64::from(stride);
+    let (n, c, h, w) = (
+        sa.dim(0).unwrap_or(0),
+        sa.dim(1).unwrap_or(0),
+        sa.dim(2).unwrap_or(0),
+        sa.dim(3).unwrap_or(0),
+    );
+    let (f, fc, kh, kw) = (
+        sb.dim(0).unwrap_or(0),
+        sb.dim(1).unwrap_or(0),
+        sb.dim(2).unwrap_or(0),
+        sb.dim(3).unwrap_or(0),
+    );
+    if c != fc {
+        return Err(RuntimeError::ShapeMismatch);
+    }
+    // Output spatial dims and total zero-padding per axis.
+    let (oh, ow, pad_h, pad_w) = match padding {
+        Padding::Valid => {
+            // Oversized kernels are rejected up front (audit F-7): Rust's
+            // truncating division would turn (h - kh) = -1 at stride >= 2
+            // into a ZERO quotient, silently producing a partial-window
+            // convolution where the reference errors.
+            if kh > h || kw > w {
+                return Err(RuntimeError::ShapeMismatch);
+            }
+            ((h - kh) / stride + 1, (w - kw) / stride + 1, 0i64, 0i64)
+        }
+        Padding::Same => {
+            let oh = (h + stride - 1) / stride;
+            let ow = (w + stride - 1) / stride;
+            let pad_h = ((oh - 1) * stride + kh - h).max(0);
+            let pad_w = ((ow - 1) * stride + kw - w).max(0);
+            (oh, ow, pad_h, pad_w)
+        }
+    };
+    if n <= 0 || f <= 0 || c <= 0 || oh <= 0 || ow <= 0 {
+        return Err(RuntimeError::ShapeMismatch);
+    }
+    // Symmetric split; the odd pixel lands bottom/right (documented).
+    let (pad_top, pad_left) = (pad_h / 2, pad_w / 2);
+    let mut out = vec![0.0f64; (n * f * oh * ow) as usize];
+    for bn in 0..n {
+        for bf in 0..f {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = 0.0;
+                    for cc in 0..c {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let iy = oy * stride + ky - pad_top;
+                                let ix = ox * stride + kx - pad_left;
+                                // Zero padding: out-of-bounds taps contribute 0.
+                                if iy < 0 || iy >= h || ix < 0 || ix >= w {
+                                    continue;
+                                }
+                                let iv = xa[((((bn * c) + cc) * h + iy) * w + ix) as usize];
+                                let wv = xb[((((bf * fc) + cc) * kh + ky) * kw + kx) as usize];
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    out[(((bn * f + bf) * oh + oy) * ow + ox) as usize] = acc;
+                }
+            }
+        }
+    }
+    let shape = Shape::from_dims(&[n, f, oh, ow]).map_err(|_| RuntimeError::ShapeMismatch)?;
     let d = table.get_mut(dst as usize).ok_or(RuntimeError::BadSlot)?;
     *d = Value::Tensor { data: out, shape };
     Ok(())
@@ -769,5 +884,269 @@ mod tests {
         if let (Ok(a), Ok(b)) = (o1, o2) {
             assert_eq!(a[0], b[0]);
         }
+    }
+
+    // CEP:WHAT: Valid convolution matches the reference triple loop.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on wrong taps.
+    // CEP:ASSUMES: 1x1x3x3 input, 1x1x2x2 filter, stride 1.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test (CEP-26 closing regression)
+    #[test]
+    fn conv_valid_reference() {
+        let tp = prog_of(
+            vec![(
+                Op::Conv {
+                    padding: Padding::Valid,
+                    stride: 1,
+                },
+                [0, 1, 0, 0, 0, 0],
+                2,
+                2,
+            )],
+            vec![2],
+            3,
+        );
+        let s_in = Shape::from_dims(&[1, 1, 3, 3])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let s_f = Shape::from_dims(&[1, 1, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let a = Value::tensor(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], s_in)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let b = Value::tensor(vec![1.0, 0.0, 0.0, 1.0], s_f)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let out = execute(&tp, &[a, b]);
+        assert!(out.is_ok(), "conv failed: {:?}", out.err());
+        if let Ok(vals) = out {
+            if let Value::Tensor { data, shape } = &vals[0] {
+                assert_eq!(data, &vec![6.0, 8.0, 12.0, 14.0]);
+                assert_eq!(shape.dim(0), Some(1));
+                assert_eq!(shape.dim(1), Some(1));
+                assert_eq!(shape.dim(2), Some(2));
+                assert_eq!(shape.dim(3), Some(2));
+            }
+        }
+    }
+
+    // CEP:WHAT: Same padding zero-fills the halo (3x3 all-ones input and
+    //           filter -> corner 4, edge 6, center 9).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if halo taps are not zero.
+    // CEP:ASSUMES: 1x1x3x3 input, 1x1x3x3 filter, stride 1.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn conv_same_zero_fill() {
+        let tp = prog_of(
+            vec![(
+                Op::Conv {
+                    padding: Padding::Same,
+                    stride: 1,
+                },
+                [0, 1, 0, 0, 0, 0],
+                2,
+                2,
+            )],
+            vec![2],
+            3,
+        );
+        let s33 = Shape::from_dims(&[1, 1, 3, 3])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let ones9 = Value::tensor(vec![1.0; 9], s33)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let out = execute(&tp, &[ones9.clone(), ones9]);
+        assert!(out.is_ok());
+        if let Ok(vals) = out {
+            if let Value::Tensor { data, .. } = &vals[0] {
+                assert_eq!(data, &vec![4.0, 6.0, 4.0, 6.0, 9.0, 6.0, 4.0, 6.0, 4.0]);
+            }
+        }
+    }
+
+    // CEP:WHAT: Stride 2 subsamples the output grid (4x4 identity-tap case).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on wrong subsampling.
+    // CEP:ASSUMES: 1x1x4x4 input, 1x1x2x2 all-ones filter, stride 2.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn conv_stride_reference() {
+        let tp = prog_of(
+            vec![(
+                Op::Conv {
+                    padding: Padding::Valid,
+                    stride: 2,
+                },
+                [0, 1, 0, 0, 0, 0],
+                2,
+                2,
+            )],
+            vec![2],
+            3,
+        );
+        let s_in = Shape::from_dims(&[1, 1, 4, 4])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let s_f = Shape::from_dims(&[1, 1, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let a = Value::tensor(
+            vec![
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                15.0,
+            ],
+            s_in,
+        )
+        .ok()
+        .unwrap_or(Value::F64(0.0));
+        let b = Value::tensor(vec![1.0; 4], s_f)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let out = execute(&tp, &[a, b]);
+        assert!(out.is_ok());
+        if let Ok(vals) = out {
+            if let Value::Tensor { data, .. } = &vals[0] {
+                assert_eq!(data, &vec![10.0, 18.0, 42.0, 50.0]);
+            }
+        }
+    }
+
+    // CEP:WHAT: Channel summation and per-filter weights are correct
+    //           (C=2 input channels, F=2 output filters).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on channel mixing.
+    // CEP:ASSUMES: 1x2x2x2 input, 2x2x1x1 filters, stride 1.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn conv_multichannel_reference() {
+        let tp = prog_of(
+            vec![(
+                Op::Conv {
+                    padding: Padding::Valid,
+                    stride: 1,
+                },
+                [0, 1, 0, 0, 0, 0],
+                2,
+                2,
+            )],
+            vec![2],
+            3,
+        );
+        let s_in = Shape::from_dims(&[1, 2, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let s_f = Shape::from_dims(&[2, 2, 1, 1])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let a = Value::tensor(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], s_in)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        // f0: (ch0 w=1, ch1 w=1); f1: (ch0 w=2, ch1 w=0).
+        let b = Value::tensor(vec![1.0, 1.0, 2.0, 0.0], s_f)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let out = execute(&tp, &[a, b]);
+        assert!(out.is_ok());
+        if let Ok(vals) = out {
+            if let Value::Tensor { data, .. } = &vals[0] {
+                // f0: ch0 + ch1 elementwise; f1: 2*ch0.
+                assert_eq!(data, &vec![6.0, 8.0, 10.0, 12.0, 2.0, 4.0, 6.0, 8.0]);
+            }
+        }
+    }
+
+    // CEP:WHAT: Oversized kernels under Valid padding are rejected (audit
+    //           F-7: truncating division would silently yield a
+    //           partial-window convolution at stride >= 2).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if a partial-window conv executes.
+    // CEP:ASSUMES: kernel larger than the input, stride 2.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn conv_valid_oversized_kernel_rejected() {
+        let tp = prog_of(
+            vec![(
+                Op::Conv {
+                    padding: Padding::Valid,
+                    stride: 2,
+                },
+                [0, 1, 0, 0, 0, 0],
+                2,
+                2,
+            )],
+            vec![2],
+            3,
+        );
+        let s_in = Shape::from_dims(&[1, 1, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let s_f = Shape::from_dims(&[1, 1, 3, 3])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let a = Value::tensor(vec![1.0; 4], s_in)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let b = Value::tensor(vec![1.0; 9], s_f)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let out = execute(&tp, &[a, b]);
+        assert_eq!(out.err(), Some(RuntimeError::ShapeMismatch));
+    }
+
+    // CEP:WHAT: Malformed operands fail loudly (rank 2 input, channel
+    //           mismatch) — never a guessed result.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if bad shapes execute.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn conv_shape_mismatch() {
+        let mk = |ops| prog_of(ops, vec![2], 3);
+        let s22 = Shape::from_dims(&[2, 2]).ok().unwrap_or(Shape::scalar());
+        let s_f = Shape::from_dims(&[1, 1, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let rank2 = Value::tensor(vec![1.0; 4], s22)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let filt = Value::tensor(vec![1.0; 4], s_f)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let t1 = mk(vec![(
+            Op::Conv {
+                padding: Padding::Valid,
+                stride: 1,
+            },
+            [0, 1, 0, 0, 0, 0],
+            2,
+            2,
+        )]);
+        // Rank-2 input against a rank-4 filter: ShapeMismatch.
+        let r1 = execute(&t1, &[rank2, filt.clone()]);
+        assert_eq!(r1.err(), Some(RuntimeError::ShapeMismatch));
+        // Channel mismatch (C=1 vs C=2).
+        let s_in = Shape::from_dims(&[1, 1, 3, 3])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let s_f2 = Shape::from_dims(&[1, 2, 2, 2])
+            .ok()
+            .unwrap_or(Shape::scalar());
+        let inp = Value::tensor(vec![1.0; 9], s_in)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let filt2 = Value::tensor(vec![1.0; 8], s_f2)
+            .ok()
+            .unwrap_or(Value::F64(0.0));
+        let r2 = execute(&t1, &[inp, filt2]);
+        assert_eq!(r2.err(), Some(RuntimeError::ShapeMismatch));
     }
 }
