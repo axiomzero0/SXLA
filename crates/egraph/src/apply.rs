@@ -587,6 +587,44 @@ mod tests {
         }
     }
 
+    // CEP:WHAT: The xir_of alignment invariant holds through a full
+    //           saturate (fold + commute + rebuild all append): one entry
+    //           per e-node (audit round 4, F-2 regression).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if any append path forgets its push.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn saturation_keeps_xir_of_alignment() {
+        use crate::lift::{lift, run_rounds};
+        let mut a = IrArena::with_capacity(32, 4);
+        let root = a.root_region();
+        let p = param(&mut a, root, Type::Scalar(ScalarType::I64));
+        let c5 = const_i64(&mut a, root, 5).ok();
+        if let Some(v5) = c5 {
+            let (in_p, in5) = (value(p), value(v5));
+            let _mul = binary(
+                &mut a,
+                root,
+                Op::Binary(BinaryOp::Mul),
+                in_p,
+                in5,
+                Type::Scalar(ScalarType::I64),
+            );
+            let lg = lift(&a, 256);
+            assert!(lg.is_ok());
+            if let Ok(mut l) = lg {
+                let _ = run_rounds(&mut l);
+                assert_eq!(
+                    l.xir_of.len(),
+                    l.g.node_count(),
+                    "xir_of must have one entry per e-node after rounds"
+                );
+            }
+        }
+    }
+
     // CEP:WHAT: Application is deterministic (identical fingerprints).
     // CEP:STATUS: complete
     // CEP:FAILURE: assert fires on nondeterminism.
@@ -638,5 +676,99 @@ mod tests {
         let f1 = IrSnapshot::new(a1).fingerprint();
         let f2 = IrSnapshot::new(a2).fingerprint();
         assert_eq!(f1, f2);
+    }
+
+    // (param - param) * 5 + 3 -> 3 : the CEP-18 annihilation chain across
+    // progressive rounds — round 1: x-x -> 0; round 2: 0*5 -> 0 (the
+    // folded zero rides class_const into the parent's rule inputs); round
+    // 3: 0+3 -> 3. Commutativity + rebuild keep the graph congruent while
+    // the chain collapses; application lands all three folds and DCE
+    // removes the dead remainder.
+    // CEP:WHAT: The integer annihilation rules fire end to end through
+    //           saturation, extraction and application.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on any stage regression.
+    // CEP:ASSUMES: i64 scalars.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn apply_annihilation_chain() {
+        let mut a = IrArena::with_capacity(32, 4);
+        let root = a.root_region();
+        let p = param(&mut a, root, Type::Scalar(ScalarType::I64));
+        let c5 = const_i64(&mut a, root, 5).ok();
+        let c3 = const_i64(&mut a, root, 3).ok();
+        if let (Some(v5), Some(v3)) = (c5, c3) {
+            let (in_p, in5, in3) = (value(p), value(v5), value(v3));
+            let sub = binary(
+                &mut a,
+                root,
+                Op::Binary(BinaryOp::Sub),
+                in_p,
+                in_p,
+                Type::Scalar(ScalarType::I64),
+            );
+            let in_sub = value(sub);
+            let mul = binary(
+                &mut a,
+                root,
+                Op::Binary(BinaryOp::Mul),
+                in_sub,
+                in5,
+                Type::Scalar(ScalarType::I64),
+            );
+            let in_mul = value(mul);
+            let add = binary(
+                &mut a,
+                root,
+                Op::Binary(BinaryOp::Add),
+                in_mul,
+                in3,
+                Type::Scalar(ScalarType::I64),
+            );
+            let roots = vec![add];
+            let out = apply(&mut a, &roots, 512);
+            assert!(out.is_ok(), "apply failed: {:?}", out.err());
+            if let Ok(o) = out {
+                assert_eq!(o.folds_applied, 3, "all three rounds must fold");
+                assert_eq!(live_count(&a), 1);
+                let folded = a
+                    .node(add)
+                    .map(|n| n.op == Op::ConstI64(3))
+                    .unwrap_or(false);
+                assert!(folded, "the root must be ConstI64(3)");
+            }
+        }
+    }
+
+    // x - x with FLOAT element type must never annihilate (x-x is NaN at
+    // x=inf, not 0) — the end-to-end gate for the elem typing.
+    // CEP:WHAT: Float self-subtraction survives application.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the float gate leaks.
+    // CEP:ASSUMES: f64 scalars.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn apply_preserves_float_self_subtraction() {
+        let mut a = IrArena::with_capacity(32, 4);
+        let root = a.root_region();
+        let p = param(&mut a, root, Type::Scalar(ScalarType::F64));
+        let sub = binary(
+            &mut a,
+            root,
+            Op::Binary(BinaryOp::Sub),
+            value(p),
+            value(p),
+            Type::Scalar(ScalarType::F64),
+        );
+        let before = live_count(&a);
+        let roots = vec![sub];
+        let out = apply(&mut a, &roots, 256);
+        assert!(out.is_ok());
+        if let Ok(o) = out {
+            assert_eq!(o.rewrites_applied, 0);
+            assert_eq!(live_count(&a), before);
+        }
     }
 }

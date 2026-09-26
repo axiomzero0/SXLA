@@ -61,6 +61,8 @@ pub(crate) struct LiftRecord {
     pub children: [u32; 4],
     /// Live child count.
     pub n_children: u8,
+    /// Element type of the node's result (rule legality gates, CEP-18).
+    pub elem: Option<xir_core::ty::ScalarType>,
 }
 
 /// The lifted e-graph plus mapping tables.
@@ -203,6 +205,7 @@ pub(crate) fn lift(arena: &IrArena, budget: usize) -> Result<LiftedGraph, Egraph
                 op: node.op,
                 children,
                 n_children: n,
+                elem: elem_of(&node.ty),
             });
             progressed = true;
         }
@@ -276,6 +279,7 @@ struct RuleSnap {
     op: Op,
     children: [u32; 4],
     consts: [Option<ConstVal>; 4],
+    elem: Option<xir_core::ty::ScalarType>,
 }
 
 /// CEP:WHAT: Runs progressive local-rule saturation rounds on ONE graph.
@@ -321,6 +325,7 @@ pub(crate) fn run_rounds(lg: &mut LiftedGraph) -> Result<u32, EgraphError> {
                 op,
                 children: cc,
                 consts,
+                elem: lg.recs[i].elem,
             });
         }
         // (2) Gear 1: partitioned pure rule evaluation (CEP-3: routed
@@ -328,13 +333,13 @@ pub(crate) fn run_rounds(lg: &mut LiftedGraph) -> Result<u32, EgraphError> {
         let mut results: Vec<Option<Rewrite>> = vec![None; n_recs];
         let workers = anvil::default_worker_count().max(1);
         let partition_ok = anvil::run_partitioned(&snaps, &mut results, workers, |s: &RuleSnap| {
-            local_rules(s.op, &s.children, &s.consts)
+            local_rules(s.op, &s.children, &s.consts, s.elem)
         })
         .is_ok();
         if !partition_ok {
             // Sequential fallback (worker bounds; same results).
             for (i, s) in snaps.iter().enumerate() {
-                results[i] = local_rules(s.op, &s.children, &s.consts);
+                results[i] = local_rules(s.op, &s.children, &s.consts, s.elem);
             }
         }
         // (3) Deterministic sequential merge by record index.
@@ -373,10 +378,81 @@ pub(crate) fn run_rounds(lg: &mut LiftedGraph) -> Result<u32, EgraphError> {
                 continue;
             }
         }
-        applied += round_fired;
-        if round_fired == 0 {
+        // Commutativity saturation (CEP-18): for every commutative binary
+        // record, add the operand-swapped e-node and merge the classes —
+        // add(b, a) and add(a, b) become provably equal, so PARENTS that
+        // differ only by operand order become congruent (the rebuild below
+        // then dedups them). Legality: commutative() gates floats off
+        // Add/Mul (38.24 rounding; Max/Min ride the documented F-18 note).
+        let mut commute_fired = 0u32;
+        for i in 0..n_recs {
+            let (op, elem, n_children) = (lg.recs[i].op, lg.recs[i].elem, lg.recs[i].n_children);
+            if n_children != 2 || !crate::rules::commutative(op, elem) {
+                continue;
+            }
+            // Canonicalize BEFORE the swapped add: records carry
+            // at-lift-time child ids; stale ids would hash to a different
+            // key and mint duplicate swapped nodes every round.
+            let c0 = lg.g.canon(lg.recs[i].children[0])?;
+            let c1 = lg.g.canon(lg.recs[i].children[1])?;
+            if c0 == c1 {
+                continue;
+            }
+            let own = lg.g.canon(
+                lg.node_class[lg.recs[i].node.index() as usize].ok_or(EgraphError::BadClass)?,
+            )?;
+            // Alignment invariant (audit round 4, F-2): one xir_of entry
+            // per APPENDED e-node — mirror the fold path's before/after
+            // check.
+            let before = lg.g.node_count();
+            let swapped = lg.g.add(op, &[c1, c0])?;
+            if lg.g.node_count() > before {
+                lg.xir_of.push(None);
+            }
+            let swapped_c = lg.g.canon(swapped)?;
+            if own != swapped_c {
+                let winner = lg.g.merge(own, swapped_c)?;
+                // class_const rides the canonical winner (audit F-6).
+                propagate_const(lg, winner, own);
+                propagate_const(lg, winner, swapped_c);
+                commute_fired += 1;
+            }
+        }
+        // Congruence rebuild (CEP-18): canonicalize children, rebuild the
+        // lookup map, merge nodes that became congruent through this
+        // round's merges. class_const is re-homed onto canonical ids after
+        // the rebuild's merges (audit F-6); the merge count participates in
+        // quiescence so a congruence cascade gets its extra round (audit F-5).
+        let merged = lg.g.rebuild()?;
+        for i in 0..lg.class_const.len() {
+            if lg.class_const[i].is_some() {
+                let canon = lg.g.canon(i as u32)?;
+                propagate_const(lg, canon, i as u32);
+            }
+        }
+        applied += round_fired + commute_fired;
+        if round_fired == 0 && commute_fired == 0 && merged == 0 {
             break;
         }
     }
     Ok(applied)
+}
+
+/// CEP:WHAT: Element type of a node's result for rule legality gates.
+/// CEP:WHY: The 38.24 discipline is element-typed: integer rewrites are
+///          exact and always legal; float rewrites need per-rule proofs.
+///          Scalars carry their type directly; tensors carry the element.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: none (None for untracked forms — rules treat it
+///              conservatively).
+/// CEP:ASSUMES: none.
+/// CEP:COST: O(1).
+/// CEP:EVIDENCE: `sub_self_is_zero_int_only`, `mul_by_zero_int_only`.
+fn elem_of(ty: &xir_core::ty::Type) -> Option<xir_core::ty::ScalarType> {
+    match ty {
+        xir_core::ty::Type::Scalar(s) => Some(*s),
+        xir_core::ty::Type::Tensor(t) => Some(t.elem),
+        xir_core::ty::Type::MemRef(t, _) => Some(t.elem),
+        _ => None,
+    }
 }

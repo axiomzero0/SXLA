@@ -508,6 +508,51 @@ mod tests {
         }
     }
 
+    // CEP:WHAT: The CEP-18 integer annihilation rules diverge Tier-2 from
+    //           Tier-1: param-param is NOT foldable at Tier 1 (operands are
+    //           not constants) but the e-graph proves x-x == 0 by CLASS
+    //           EQUALITY and the chain collapses to a constant.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the annihilation rules regress.
+    // CEP:ASSUMES: i64 program (param - param) * 5 + 3.
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn tier2_annihilates_self_subtraction() {
+        // NOTE: explicit scalar<i64> annotations — the parser's untyped
+        // default is scalar<f64>, and FLOAT x-x must never annihilate
+        // (x-x is NaN at x=inf); the integer gate is the point.
+        const SRC5: &str = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0 : scalar<i64>\n",
+            "  %1 = binary.sub %0, %0 : scalar<i64>\n",
+            "  %2 = const.i64 5 : scalar<i64>\n",
+            "  %3 = binary.mul %1, %2 : scalar<i64>\n",
+            "  %4 = const.i64 3 : scalar<i64>\n",
+            "  %5 = binary.add %3, %4 : scalar<i64>\n",
+            "}\n",
+        );
+        let t1 = compile_text(SRC5, Tier::Tier1);
+        let t2 = compile_text(SRC5, Tier::Tier2);
+        assert!(t1.is_ok() && t2.is_ok());
+        if let (Ok(a), Ok(b)) = (t1, t2) {
+            // Tier 1: sub + const5 + mul + const3 + add = 5 instrs.
+            // Tier 2: x-x -> 0, 0*5 -> 0, 0+3 -> 3: ONE instr.
+            assert_eq!(a.target.instrs.len(), 5);
+            assert_eq!(b.target.instrs.len(), 1);
+            // Differential: any param value gives 3 at both tiers.
+            use runtime::interp::execute;
+            use runtime::value::Value;
+            let va = execute(&a.target, &[Value::I64(41)]);
+            let vb = execute(&b.target, &[Value::I64(41)]);
+            assert!(va.is_ok() && vb.is_ok());
+            if let (Ok(xa), Ok(xb)) = (va, vb) {
+                assert_eq!(xa[0], Value::I64(3));
+                assert_eq!(xb[0], Value::I64(3));
+            }
+        }
+    }
+
     // Float identity: param(f64) + 0.0 must survive EVERY tier (38.24
     // signed-zero discipline — x + 0.0 differs from x at x = -0.0).
     // CEP:WHAT: The e-graph never eliminates float zero identities.

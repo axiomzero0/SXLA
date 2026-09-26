@@ -32,6 +32,9 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Fusion-aware extraction penalties | complete | extract tests |
 | Saturation (Gear-1 local rules, pooled) | complete | saturate tests |
 | E-graph extraction application (CEP-17) | complete | apply tests + jit tier-2 differential |
+| E-graph congruence rebuild + full-proof add (CEP-18) | complete | rebuild/idempotence tests |
+| E-graph commutativity saturation (int-gated) | complete | saturation + apply chain tests |
+| Integer annihilation rules (x-x, x*0; CEP-18) | complete | rules tests + `tier2_annihilates_self_subtraction` |
 | Persistent worker pool (CEP-3) | complete | pool tests; bench 1.7us vs 53.7us region setup |
 | If-region text round-trip (CEP-12) | complete | text/verifier if-region tests |
 | Conv reference kernel (CEP-26) | complete | conv_valid/same/stride/multichannel tests |
@@ -50,7 +53,8 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Item | Status | Ticket |
 |------|--------|--------|
 | NUMA-aware allocation | placeholder | CEP-2 |
-| E-graph cross-worker SPSC merges | partial (Gear-1 pooled local rules now) | CEP-17 |
+| E-graph cross-worker SPSC merges | partial (Gear-1 pooled local rules + congruence rebuild now) | CEP-17 |
+| Structural rewrite rules (distributivity, strength reduction) | partial (local + commutativity + annihilation landed) | CEP-18 |
 | Presburger/ISL legality | partial (affine subset) | CEP-19 |
 | Tier-2 ML ranker | placeholder (Tier-1 fallback, reported) | CEP-20 |
 | Tier-3 autotuning | stub (loud failure) | CEP-21 |
@@ -123,6 +127,36 @@ project_with_fusion, driver wiring) found 0 S0, 2 S1, 7 S2. All remediated:
   documented; the tier-2 manifest's phantom `verify` token dropped (the
   search is read-only over the verified arena); the consumers map builds
   only on the fusion-aware path.
+
+## Fourth audit round (session 2, increment 3) and remediation
+
+An audit of the CEP-18 increment (annihilation rules, congruence rebuild,
+commutativity saturation) found 0 S0, 2 S1, 6 S2. All remediated:
+
+- **S1-1 (unsound merge)**: float Max/Min commutativity merged
+  max(+0.0,-0.0) with max(-0.0,+0.0) — IEEE maxnum may return either zero
+  on ties, so the merge could rewrite one fold to the other's bit pattern.
+  Max/Min commutativity is now integer-gated like Add/Mul
+  (`float_max_commute_banned`).
+- **S1-2 (broken invariant)**: the commute pass appended e-nodes without
+  their xir_of entries (the fold path's alignment discipline); the new
+  `saturation_keeps_xir_of_alignment` regression caught a second silent
+  edit failure during remediation itself — both the bug and the fix
+  process are now pinned by the test.
+- S2s: the integer gate drops I32 (the Op vocabulary has no I32 consts —
+  application could never land those folds; the gate now matches reality);
+  congruence compares ConstF64 by BITS (identical NaNs dedup instead of
+  minting duplicates every round, `nan_consts_are_congruent`); rebuild's
+  merge count participates in quiescence (congruence cascades get their
+  round); class_const propagates on commute and rebuild merges; the
+  elem-trust ASSUMES documents the verifier's missing operand/result
+  type-agreement check (pre-existing gap, now load-bearing — see below);
+  add() rejects >4 children loudly (`TooManyChildren`).
+
+Open item from this round: the verifier lacks an operand/result
+type-agreement check (mis-annotated programs can route float values
+through integer-gated rules). The e-graph's application layer refuses
+those rewrites conservatively; a verifier check is the durable fix.
 
 ## Waivers
 
