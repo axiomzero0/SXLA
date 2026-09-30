@@ -260,10 +260,14 @@ fn is_one(v: Option<ConstVal>) -> bool {
 ///          means "untracked" — conservative integer-only for every op.
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none (false = do not commute).
-/// CEP:ASSUMES: elem reflects the tensor/scalar element of the operands;
-///           verified value-producing Binary nodes always carry a concrete
-///           type (the verifier rejects Type::None results), so None is a
-///          defensive fallback, not a live path.
+/// CEP:ASSUMES: elem reflects the tensor/scalar element of the node's
+///           declared type. The verifier now carries the other half of the
+///           proof (TypeDisagreement, 38.18): an integer-typed value op
+///           consuming a float-typed operand fails verification loudly, so
+///           the integer direction of this gate can trust elem.
+///           Float-claiming nodes MAY consume integer operands (the
+///           interpreter's promotion contract), which is why None stays
+///           the conservative integer-only fallback.
 /// CEP:COST: O(1)
 /// CEP:EVIDENCE: test `commutativity_gates_floats`,
 ///           `float_max_commute_banned`.

@@ -1,6 +1,10 @@
 // CEP:FILE: crates/xir-graph/src/verifier.rs
 // CEP:WHAT: The XIR IR verifier — use-def, region, arity, effect and type
-//           invariant checks (CEP&CC 38.18 required checks, cheap mode).
+//           invariant checks (CEP&CC 38.18 required checks, cheap mode),
+//           including operand/result element agreement: an integer-typed
+//           value op consuming a float-typed operand is rejected loudly
+//           (mis-annotations would route float values through the
+//           integer-gated rewrites of CEP&CC 38.24).
 // CEP:WHY: HPC prime law: "A compiler must never silently change the meaning
 //          of a program" — every mutation must be verified before the next
 //          pass observes it. This verifier is the single authority on IR
@@ -16,7 +20,8 @@
 // CEP:COST: O(nodes*depth + regions); ZERO allocation (the dominance walk
 //           uses bounded parent chains, no tables).
 // CEP:EVIDENCE: tests `valid_ir_passes`, `broken_use_def_detected`,
-//           `arity_violations_detected`.
+//           `arity_violations_detected`, `int_node_with_float_operand_rejected`,
+//           `mixed_promotion_program_still_verifies`.
 // CEP:SECURITY: IR is treated as untrusted input; all lookups bounds-checked.
 // CEP:HPC-IR: "Verifies dominance and use-def chains" (38.18 mapping) —
 //           the dominance check IS implemented (audit F-5 regression).
@@ -61,6 +66,10 @@ pub enum VerifierError {
     BadRegionOwner(NodeId),
     /// An If node does not own exactly two (then, else) regions — CEP-12.
     BadIfRegions(NodeId),
+    /// An integer-typed value op consumes a float-typed operand: the
+    /// mis-annotation routes float values through integer-gated rewrites
+    /// (CEP&CC 38.24) — the fourth audit round's open item, closed here.
+    TypeDisagreement(NodeId),
 }
 
 /// Expected input arity per opcode (the closed contract).
@@ -185,6 +194,74 @@ pub fn verify(arena: &IrArena) -> Result<(), VerifierError> {
     }
 }
 
+/// CEP:WHAT: The element type carried by a value type.
+/// CEP:WHY: Element agreement is the operand/result contract the integer
+///          rewrite gates (38.24) trust; scalars carry it directly, tensors
+///          and memrefs carry it in their descriptor.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: none; Token/None carry no element (None).
+/// CEP:ASSUMES: none.
+/// CEP:COST: branch.
+/// CEP:EVIDENCE: tests `int_node_with_float_operand_rejected`.
+fn elem_of(ty: &Type) -> Option<xir_core::ty::ScalarType> {
+    match ty {
+        Type::Scalar(s) => Some(*s),
+        Type::Tensor(t) => Some(t.elem),
+        Type::MemRef(t, _) => Some(t.elem),
+        Type::Token | Type::None => None,
+    }
+}
+
+/// CEP:WHAT: Reports whether a value op claims an integer element and
+///           therefore opens the integer-gated rewrites (38.24).
+/// CEP:WHY: The e-graph gates (rules::commutative, integer annihilation)
+///          branch on the node's declared element; soundness of "integer"
+///          rewrites requires that no float-typed operand feeds the node.
+///          This is the verifier half of that proof (the gates are the
+///          other half) — the durable fix for the fourth audit round's
+///          open item.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: false for ops with unknown operand contracts (Custom,
+///              If, target/loop markers) — never a false positive.
+/// CEP:ASSUMES: float-claiming nodes MAY consume integer operands (the
+///              interpreter's documented promotion contract — mixed-type
+///              pairs skip folding and promote at execution); the ban is
+///              one-directional by design.
+/// CEP:COST: 2 branches.
+/// CEP:EVIDENCE: tests `int_node_with_float_operand_rejected`,
+///              `mixed_promotion_program_still_verifies`.
+fn claims_integer_element(op: Op, ty: &Type) -> bool {
+    let elem_consuming = matches!(
+        op,
+        Op::Binary(_)
+            | Op::Unary(_)
+            | Op::Dot
+            | Op::Reduce { .. }
+            | Op::Matmul { .. }
+            | Op::Conv { .. }
+            | Op::Broadcast { .. }
+            | Op::Transpose { .. }
+    );
+    elem_consuming
+        && matches!(
+            elem_of(ty),
+            Some(xir_core::ty::ScalarType::I64) | Some(xir_core::ty::ScalarType::I32)
+        )
+}
+
+/// CEP:WHAT: Reports whether an operand type carries a float element.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: none.
+/// CEP:ASSUMES: none.
+/// CEP:COST: branch.
+/// CEP:EVIDENCE: tests `int_node_with_float_operand_rejected`.
+fn operand_elem_is_float(ty: &Type) -> bool {
+    matches!(
+        elem_of(ty),
+        Some(xir_core::ty::ScalarType::F64) | Some(xir_core::ty::ScalarType::F32)
+    )
+}
+
 /// CEP:WHAT: Checks that value definitions dominate their uses.
 /// CEP:WHY: 38.18 "dominance validity": in the structured region tree a
 ///          use may only reference values whose defining region is an
@@ -275,12 +352,20 @@ fn verify_node(arena: &IrArena, id: NodeId, node: &Node) -> Option<VerifierError
             return Some(VerifierError::UseDefInvalid(id));
         }
         let def = v.node();
-        match arena.node(def) {
-            Ok(_) => {}
+        let def_ty = match arena.node(def) {
+            Ok(n) => n.ty,
             Err(_) => return Some(VerifierError::UseDefInvalid(id)),
-        }
+        };
         if v.slot() != 0 {
             return Some(VerifierError::SlotInvalid(id));
+        }
+        // Operand/result element agreement (38.18 type correctness): an
+        // integer-claiming value op consuming a float-typed operand is a
+        // mis-annotation that would route float values through the
+        // integer-gated rewrites (38.24). Float-claiming nodes consuming
+        // integer operands are the promotion contract and stay legal.
+        if claims_integer_element(node.op, &node.ty) && operand_elem_is_float(&def_ty) {
+            return Some(VerifierError::TypeDisagreement(id));
         }
     }
     // Effect chain: effectful ops need a token or a leading effect position.
@@ -514,6 +599,92 @@ mod tests {
         assert!(id.is_ok());
         if let Ok(id) = id {
             assert_eq!(verify(&a), Err(VerifierError::TypeInvalid(id)));
+        }
+    }
+
+    // CEP:WHAT: An integer-typed binary consuming float-typed operands is
+    //           rejected (the fourth audit round's open item, closed): the
+    //           mis-annotation would route float values through the
+    //           integer-gated rewrites of 38.24 (commutativity, integer
+    //           annihilation).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the mis-annotation verifies.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn int_node_with_float_operand_rejected() {
+        let mut a = IrArena::with_capacity(16, 4);
+        let root = a.root_region();
+        let c1 = const_f64(&mut a, root, 2.5);
+        let c2 = const_f64(&mut a, root, 3.5);
+        assert!(c1.is_ok() && c2.is_ok());
+        if let (Ok(v1), Ok(v2)) = (c1, c2) {
+            let (i1, i2) = (a.value_of(v1, 0), a.value_of(v2, 0));
+            assert!(i1.is_ok() && i2.is_ok());
+            if let (Ok(x1), Ok(x2)) = (i1, i2) {
+                // The node claims i64 while both operands produce f64.
+                let node = Node::new(
+                    Op::Binary(xir_core::op::BinaryOp::Add),
+                    root,
+                    &[x1, x2],
+                    Type::Scalar(xir_core::ty::ScalarType::I64),
+                );
+                let id = a.insert_node(root, node);
+                assert!(id.is_ok());
+                if let Ok(id) = id {
+                    assert_eq!(verify(&a), Err(VerifierError::TypeDisagreement(id)));
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: A float-typed node consuming an integer operand still
+    //           verifies — the interpreter's promotion contract (mixed
+    //           pairs skip folding and promote at execution; pinned by the
+    //           JIT differential test SRC2). The agreement ban is
+    //           one-directional by design.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if promotion programs are over-rejected.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn mixed_promotion_program_still_verifies() {
+        let src = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0\n",
+            "  %1 = const.i64 0\n",
+            "  %2 = binary.add %0, %1\n",
+            "}\n",
+        );
+        let arena = xir_core::text::parse_arena(src, 64);
+        assert!(arena.is_ok(), "parse error: {:?}", arena.err());
+        if let Ok(a) = arena {
+            assert_eq!(verify(&a), Ok(()));
+        }
+    }
+
+    // CEP:WHAT: A fully integer-typed chain verifies (the agreement check
+    //           never over-rejects the honest integer path).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on false rejection.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn int_chain_verifies() {
+        let src = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = const.i64 3 : scalar<i64>\n",
+            "  %1 = const.i64 4 : scalar<i64>\n",
+            "  %2 = binary.add %0, %1 : scalar<i64>\n",
+            "}\n",
+        );
+        let arena = xir_core::text::parse_arena(src, 64);
+        assert!(arena.is_ok(), "parse error: {:?}", arena.err());
+        if let Ok(a) = arena {
+            assert_eq!(verify(&a), Ok(()));
         }
     }
 

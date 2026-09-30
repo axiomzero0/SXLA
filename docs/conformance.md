@@ -153,10 +153,16 @@ commutativity saturation) found 0 S0, 2 S1, 6 S2. All remediated:
   type-agreement check (pre-existing gap, now load-bearing — see below);
   add() rejects >4 children loudly (`TooManyChildren`).
 
-Open item from this round: the verifier lacks an operand/result
-type-agreement check (mis-annotated programs can route float values
-through integer-gated rules). The e-graph's application layer refuses
-those rewrites conservatively; a verifier check is the durable fix.
+Open item from this round: CLOSED (session 3). The verifier now checks
+operand/result element agreement: an integer-typed value op consuming a
+float-typed operand fails verification loudly (`TypeDisagreement`;
+regressions `int_node_with_float_operand_rejected` plus the promotion
+contract pin `mixed_promotion_program_still_verifies`). Mis-annotated
+programs can no longer route float values through integer-gated rules;
+the e-graph application layer's conservative refusal remains as defense
+in depth. The check is one-directional by design — float-typed nodes
+consuming integer operands are the interpreter's documented promotion
+contract (the SRC2 differential chain).
 
 ## Waivers
 
