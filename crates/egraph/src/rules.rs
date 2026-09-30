@@ -81,11 +81,12 @@ pub struct Rewrite {
 ///           constant; children are canonical classes; `elem` reflects
 ///           the node's ANNOTATED element type. The verifier guarantees
 ///           value-producing Binary/Unary nodes carry a concrete
-///           (non-None) result type, so elem None is a defensive fallback
-///           that treats rules as integer-eligible — sound only under
-///           that verifier guarantee (mis-annotated programs are a
-///           documented verifier gap: no operand/result type-agreement
-///           check exists yet; see conformance.md).
+///           (non-None, non-Token) result type, so elem None is a defensive
+///           fallback that treats rules as integer-eligible — sound only
+///           under that verifier guarantee (the operand/result element
+///           agreement check TypeDisagreement, 38.18, now rejects
+///           integer-typed value ops consuming float-typed operands; see
+///           conformance.md).
 /// CEP:COST: O(1).
 /// CEP:EVIDENCE: tests `constant_folding_fires`, `identity_elimination`,
 ///           `sub_self_is_zero_int_only`, `mul_by_zero_int_only`.
@@ -120,17 +121,30 @@ pub fn local_rules(
             // Signed-zero discipline (audit F-6, CEP&CC 38.24): x + 0.0
             // is NOT x when x = -0.0 (the true result is +0.0). Integer
             // identities are exact; FLOAT zero identities are excluded.
-            let lhs_zero = is_zero_int(ca);
-            let rhs_zero = is_zero_int(cc);
-            let rhs_one = is_one(cc);
-            let use_child = match b {
-                // x + 0 -> x ; 0 + x -> x
-                BinaryOp::Add if rhs_zero || lhs_zero => Some(if rhs_zero { a } else { c }),
-                // x * 1 -> x
-                BinaryOp::Mul if rhs_one => Some(a),
-                // x - 0 -> x
-                BinaryOp::Sub if rhs_zero => Some(a),
-                _ => None,
+            // Audit round 5 (session 3): the gate is the NODE'S element
+            // (is_int), not the constant's KIND — a float-annotated add
+            // consuming an integer zero (mixed kinds) must not fire
+            // either. Mixed pairs fail loudly at execution
+            // (RuntimeError::UnsupportedValue) on every tier; firing here
+            // would delete the trapping instruction at saturating tiers
+            // only (reproduced tier-0-error vs tier-2-value divergence),
+            // and under promotion semantics it would also flip -0.0 to
+            // +0.0. Same discipline as the annihilation gate below.
+            let use_child = if is_int {
+                let lhs_zero = is_zero_int(ca);
+                let rhs_zero = is_zero_int(cc);
+                let rhs_one = is_one(cc);
+                match b {
+                    // x + 0 -> x ; 0 + x -> x
+                    BinaryOp::Add if rhs_zero || lhs_zero => Some(if rhs_zero { a } else { c }),
+                    // x * 1 -> x
+                    BinaryOp::Mul if rhs_one => Some(a),
+                    // x - 0 -> x
+                    BinaryOp::Sub if rhs_zero => Some(a),
+                    _ => None,
+                }
+            } else {
+                None
             };
             let r = use_child.map(|ch| Rewrite {
                 op: Op::Param { index: u32::MAX }, // marker: pass-through (driver maps to the child's op)
@@ -265,8 +279,10 @@ fn is_one(v: Option<ConstVal>) -> bool {
 ///           proof (TypeDisagreement, 38.18): an integer-typed value op
 ///           consuming a float-typed operand fails verification loudly, so
 ///           the integer direction of this gate can trust elem.
-///           Float-claiming nodes MAY consume integer operands (the
-///           interpreter's promotion contract), which is why None stays
+///           Float-claiming nodes MAY consume integer operands (mixed
+///           kinds fail loudly at execution — RuntimeError::
+///           UnsupportedValue; mixed constant pairs fold via xir-graph's
+///           const_f64_of i64-to-f64 coercion), which is why None stays
 ///           the conservative integer-only fallback.
 /// CEP:COST: O(1)
 /// CEP:EVIDENCE: test `commutativity_gates_floats`,
@@ -392,6 +408,45 @@ mod tests {
             Some(ScalarType::F64),
         );
         assert_eq!(r2, None);
+    }
+
+    // CEP:WHAT: Mixed-kind identities are excluded (audit round 5): a
+    //           float-annotated add consuming an INTEGER zero must not
+    //           fire x+0->x — the gate is the node's element (is_int),
+    //           not the constant's kind. Pre-fix this fired and deleted
+    //           the trapping add at saturating tiers only (reproduced
+    //           tier-0-error vs tier-2-value divergence).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if the mixed identity is eliminated.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test + driver `mixed_kind_failure_agrees_across_tiers`
+    #[test]
+    fn mixed_kind_identity_excluded() {
+        // F64 node + const.i64 0 -> x: must NOT fire.
+        let r = local_rules(
+            Op::Binary(BinaryOp::Add),
+            &[7, 8, 0, 0],
+            &[None, Some(ConstVal::I(0)), None, None],
+            Some(ScalarType::F64),
+        );
+        assert_eq!(r, None, "float-node integer-zero identity must not fire");
+        // F64 node + const.i64 1 -> x*1: must NOT fire.
+        let r2 = local_rules(
+            Op::Binary(BinaryOp::Mul),
+            &[7, 8, 0, 0],
+            &[None, Some(ConstVal::I(1)), None, None],
+            Some(ScalarType::F64),
+        );
+        assert_eq!(r2, None, "float-node integer-one identity must not fire");
+        // F32 node + const.i64 0 -> x: must NOT fire.
+        let r3 = local_rules(
+            Op::Binary(BinaryOp::Add),
+            &[7, 8, 0, 0],
+            &[None, Some(ConstVal::I(0)), None, None],
+            Some(ScalarType::F32),
+        );
+        assert_eq!(r3, None, "float32-node integer-zero identity must not fire");
     }
 
     // CEP:WHAT: Commutativity gates floats out, integers in.

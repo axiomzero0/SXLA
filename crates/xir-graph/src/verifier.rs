@@ -21,7 +21,7 @@
 //           uses bounded parent chains, no tables).
 // CEP:EVIDENCE: tests `valid_ir_passes`, `broken_use_def_detected`,
 //           `arity_violations_detected`, `int_node_with_float_operand_rejected`,
-//           `mixed_promotion_program_still_verifies`.
+//           `mixed_kind_program_still_verifies`, `token_typed_value_op_rejected`.
 // CEP:SECURITY: IR is treated as untrusted input; all lookups bounds-checked.
 // CEP:HPC-IR: "Verifies dominance and use-def chains" (38.18 mapping) —
 //           the dominance check IS implemented (audit F-5 regression).
@@ -214,22 +214,27 @@ fn elem_of(ty: &Type) -> Option<xir_core::ty::ScalarType> {
 
 /// CEP:WHAT: Reports whether a value op claims an integer element and
 ///           therefore opens the integer-gated rewrites (38.24).
-/// CEP:WHY: The e-graph gates (rules::commutative, integer annihilation)
-///          branch on the node's declared element; soundness of "integer"
-///          rewrites requires that no float-typed operand feeds the node.
-///          This is the verifier half of that proof (the gates are the
-///          other half) — the durable fix for the fourth audit round's
-///          open item.
+/// CEP:WHY: The e-graph gates (rules::commutative, integer annihilation,
+///          identity elimination) branch on the node's declared element;
+///          soundness of "integer" rewrites requires that no float-typed
+///          operand feeds the node. This is the verifier half of that
+///          proof (the gates are the other half) — the durable fix for
+///          the fourth audit round's open item.
 /// CEP:STATUS: complete
 /// CEP:FAILURE: false for ops with unknown operand contracts (Custom,
 ///              If, target/loop markers) — never a false positive.
-/// CEP:ASSUMES: float-claiming nodes MAY consume integer operands (the
-///              interpreter's documented promotion contract — mixed-type
-///              pairs skip folding and promote at execution); the ban is
-///              one-directional by design.
-/// CEP:COST: 2 branches.
+/// CEP:ASSUMES: float-claiming nodes MAY consume integer operands: mixed
+///              kinds fail loudly at execution (RuntimeError::
+///              UnsupportedValue) and mixed constant pairs fold through
+///              xir-graph's documented const_f64_of i64-to-f64 coercion.
+///              The ban is one-directional by design — mis-filing the
+///              loud-failure direction as TypeDisagreement would swap a
+///              runtime refusal for a compile-time one and hide the
+///              mixed pair from the differential tests that pin tier
+///              agreement on failure.
+/// CEP:COST: branch table + 2 branches.
 /// CEP:EVIDENCE: tests `int_node_with_float_operand_rejected`,
-///              `mixed_promotion_program_still_verifies`.
+///              `mixed_kind_program_still_verifies`.
 fn claims_integer_element(op: Op, ty: &Type) -> bool {
     let elem_consuming = matches!(
         op,
@@ -250,6 +255,10 @@ fn claims_integer_element(op: Op, ty: &Type) -> bool {
 }
 
 /// CEP:WHAT: Reports whether an operand type carries a float element.
+/// CEP:WHY: The banned direction of the element-agreement check: float
+///          producers are the values that integer-gated rewrites must
+///          never consume (38.24); integer producers feeding float nodes
+///          stay legal (loud runtime refusal / constant coercion).
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none.
 /// CEP:ASSUMES: none.
@@ -338,8 +347,11 @@ fn verify_node(arena: &IrArena, id: NodeId, node: &Node) -> Option<VerifierError
     if node.n_inputs != expected_arity(node.op) {
         return Some(VerifierError::ArityInvalid(id));
     }
-    // Type: value-producing ops need a real type.
-    if produces_value(node.op) && node.ty == Type::None {
+    // Type: value-producing ops need a real value type — Token types the
+    // effect EDGES, never results; a Token-typed result would lift with
+    // elem=None, which the e-graph rules treat as integer-eligible,
+    // bypassing the float-commute ban by annotation (audit round 5).
+    if produces_value(node.op) && matches!(node.ty, Type::None | Type::Token) {
         return Some(VerifierError::TypeInvalid(id));
     }
     // Use-def + slot discipline.
@@ -363,7 +375,9 @@ fn verify_node(arena: &IrArena, id: NodeId, node: &Node) -> Option<VerifierError
         // integer-claiming value op consuming a float-typed operand is a
         // mis-annotation that would route float values through the
         // integer-gated rewrites (38.24). Float-claiming nodes consuming
-        // integer operands are the promotion contract and stay legal.
+        // integer operands stay legal: mixed kinds fail loudly at
+        // execution (RuntimeError::UnsupportedValue) and mixed constant
+        // pairs fold via const_f64_of's i64-to-f64 coercion.
         if claims_integer_element(node.op, &node.ty) && operand_elem_is_float(&def_ty) {
             return Some(VerifierError::TypeDisagreement(id));
         }
@@ -639,18 +653,56 @@ mod tests {
         }
     }
 
-    // CEP:WHAT: A float-typed node consuming an integer operand still
-    //           verifies — the interpreter's promotion contract (mixed
-    //           pairs skip folding and promote at execution; pinned by the
-    //           JIT differential test SRC2). The agreement ban is
-    //           one-directional by design.
+    // CEP:WHAT: A Token-typed result on a value-producing op is rejected
+    //           (audit round 5): Token types the effect edges, never
+    //           results; a Token-typed binary would lift with elem=None,
+    //           which the e-graph rules treat as integer-eligible — an
+    //           annotation bypass of the float-commute ban (38.24).
     // CEP:STATUS: complete
-    // CEP:FAILURE: assert fires if promotion programs are over-rejected.
+    // CEP:FAILURE: assert fires if the Token-typed value op verifies.
     // CEP:ASSUMES: none
     // CEP:COST: test-only
     // CEP:EVIDENCE: this test
     #[test]
-    fn mixed_promotion_program_still_verifies() {
+    fn token_typed_value_op_rejected() {
+        let mut a = IrArena::with_capacity(16, 4);
+        let root = a.root_region();
+        let c1 = const_f64(&mut a, root, 1.0);
+        let c2 = const_f64(&mut a, root, 2.0);
+        assert!(c1.is_ok() && c2.is_ok());
+        if let (Ok(v1), Ok(v2)) = (c1, c2) {
+            let (i1, i2) = (a.value_of(v1, 0), a.value_of(v2, 0));
+            assert!(i1.is_ok() && i2.is_ok());
+            if let (Ok(x1), Ok(x2)) = (i1, i2) {
+                let node = Node::new(
+                    Op::Binary(xir_core::op::BinaryOp::Add),
+                    root,
+                    &[x1, x2],
+                    Type::Token,
+                );
+                let id = a.insert_node(root, node);
+                assert!(id.is_ok());
+                if let Ok(id) = id {
+                    assert_eq!(verify(&a), Err(VerifierError::TypeInvalid(id)));
+                }
+            }
+        }
+    }
+
+    // CEP:WHAT: A float-typed node consuming an integer operand still
+    //           verifies — the loud-failure mixed direction (execution
+    //           refuses mixed kinds with RuntimeError::UnsupportedValue;
+    //           mixed constant pairs fold via const_f64_of's i64-to-f64
+    //           coercion). Keeping this direction OUT of TypeDisagreement
+    //           preserves the runtime refusal as the observable behavior
+    //           the tier differential tests pin (audit round 5).
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if mixed programs are over-rejected.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test + jit `mixed_kind_failure_agrees_across_tiers`
+    #[test]
+    fn mixed_kind_program_still_verifies() {
         let src = concat!(
             "xir v1 func @main {\n",
             "  %0 = param 0\n",

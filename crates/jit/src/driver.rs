@@ -402,11 +402,14 @@ mod tests {
         assert_eq!(t3.err(), Some(JitError::Pipeline("tier3-pgo-unavailable")));
     }
 
-    // Integer identity: param + 0 survives Tier 1 (fold needs both operands
-    // constant) but the Tier-2 e-graph eliminates it (saturation discovers
-    // x+0 == x; extraction selects the operand; application rewires the
-    // consumer) — tiers MUST diverge in instruction count while agreeing on
-    // values (CEP-17 closing regression).
+    // Integer identity: i64 param + 0 survives Tier 1 (fold needs both
+    // operands constant) but the Tier-2 e-graph eliminates it (saturation
+    // discovers x+0 == x; extraction selects the operand; application
+    // rewires the consumer) — tiers MUST diverge in instruction count
+    // while agreeing on values (CEP-17 closing regression). The fixture
+    // is i64-ANNOTATED end to end: the identity gate is the node's
+    // element (audit round 5), so a float-annotated variant must NOT
+    // fire (see mixed_kind_failure_agrees_across_tiers below).
     // CEP:WHAT: Tier-2 e-graph application optimizes beyond Tier-1.
     // CEP:STATUS: complete
     // CEP:FAILURE: assert fires if the identity is not eliminated or if
@@ -416,7 +419,7 @@ mod tests {
     // CEP:EVIDENCE: this test
     #[test]
     fn tier2_egraph_identity_diverges_from_tier1() {
-        const SRC2: &str = "xir v1 func @main {\n  %0 = param 0\n  %1 = const.i64 0\n  %2 = binary.add %0, %1\n  %3 = const.i64 7\n  %4 = binary.mul %2, %3\n}\n";
+        const SRC2: &str = "xir v1 func @main {\n  %0 = param 0 : scalar<i64>\n  %1 = const.i64 0\n  %2 = binary.add %0, %1 : scalar<i64>\n  %3 = const.i64 7\n  %4 = binary.mul %2, %3 : scalar<i64>\n}\n";
         let t1 = compile_text(SRC2, Tier::Tier1);
         let t2 = compile_text(SRC2, Tier::Tier2);
         assert!(t1.is_ok() && t2.is_ok());
@@ -437,6 +440,48 @@ mod tests {
             if let (Ok(xa), Ok(xb)) = (va, vb) {
                 assert_eq!(xa[0], Value::I64(35));
                 assert_eq!(xb[0], Value::I64(35));
+            }
+        }
+    }
+
+    // CEP:WHAT: Mixed-kind programs (float-annotated add consuming an
+    //           integer zero) fail IDENTICALLY at every tier (audit round
+    //           5): the identity elimination is element-gated, so the
+    //           saturating tier never deletes the trapping add. Tier
+    //           agreement on FAILURE is part of 38.45 differential
+    //           testing — the prime law covers error behavior, not just
+    //           values. Pre-fix, Tier 2 returned result 0.000000 while
+    //           Tiers 0/1 failed with UnsupportedValue.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires if any tier silently succeeds on the
+    //               mixed pair (or if a tier's compile fails).
+    // CEP:ASSUMES: the program verifies (float node + int operand is the
+    //               legal mixed direction; execution refuses it loudly).
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn mixed_kind_failure_agrees_across_tiers() {
+        const SRCM: &str = concat!(
+            "xir v1 func @main {\n",
+            "  %0 = param 0\n",
+            "  %1 = const.i64 0\n",
+            "  %2 = binary.add %0, %1\n",
+            "  %3 = unary.neg %2\n",
+            "}\n",
+        );
+        use runtime::interp::execute;
+        use runtime::value::Value;
+        for tier in [Tier::Tier0, Tier::Tier1, Tier::Tier2] {
+            let c = compile_text(SRCM, tier);
+            assert!(c.is_ok(), "tier {:?} must compile", tier);
+            if let Ok(compiled) = c {
+                let out = execute(&compiled.target, &[Value::F64(-0.0)]);
+                assert!(
+                    out.is_err(),
+                    "tier {:?} must refuse mixed kinds loudly, got {:?}",
+                    tier,
+                    out.ok()
+                );
             }
         }
     }

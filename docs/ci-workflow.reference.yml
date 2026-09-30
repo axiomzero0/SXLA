@@ -65,7 +65,12 @@ jobs:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
         run: |
           cargo +nightly test --workspace --tests --target x86_64-unknown-linux-gnu
-# NOTE: this reference copy under docs/ is mirrored live at
-# .github/workflows/ci.yml (pushed with a workflow-scoped credential).
-# Keep the two in sync: edit here, copy over, commit both in one change
-# (CEP&CC 10.5 — documentation must match the deployed state).
+# NOTE: this reference copy specifies the CI gates, but the live install
+# at .github/workflows/ci.yml is NOT yet committed or pushed: GitHub
+# rejects .github/workflows/ changes from credentials without `workflow`
+# scope (both the git push and the contents API refuse; see waiver W-4).
+# The file sits ready in the working tree — commit and push it with a
+# workflow-scoped credential (or upload it via the Actions web UI) to
+# activate the gates. Until then, CEP:EVIDENCE fields citing this
+# workflow describe the pipeline this reference specifies, not an
+# executing CI (Law 8: no stale documentation).

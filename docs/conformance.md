@@ -150,19 +150,74 @@ commutativity saturation) found 0 S0, 2 S1, 6 S2. All remediated:
   merge count participates in quiescence (congruence cascades get their
   round); class_const propagates on commute and rebuild merges; the
   elem-trust ASSUMES documents the verifier's missing operand/result
-  type-agreement check (pre-existing gap, now load-bearing — see below);
+  type-agreement check (pre-existing gap, closed below);
   add() rejects >4 children loudly (`TooManyChildren`).
 
-Open item from this round: CLOSED (session 3). The verifier now checks
-operand/result element agreement: an integer-typed value op consuming a
-float-typed operand fails verification loudly (`TypeDisagreement`;
-regressions `int_node_with_float_operand_rejected` plus the promotion
-contract pin `mixed_promotion_program_still_verifies`). Mis-annotated
-programs can no longer route float values through integer-gated rules;
-the e-graph application layer's conservative refusal remains as defense
-in depth. The check is one-directional by design — float-typed nodes
-consuming integer operands are the interpreter's documented promotion
-contract (the SRC2 differential chain).
+Open item from this round: CLOSED (session 3; corrected in the fifth
+round below). The verifier checks operand/result element agreement:
+an integer-typed value op consuming a float-typed operand fails
+verification loudly (`TypeDisagreement`; regression
+`int_node_with_float_operand_rejected`, over-rejection guards
+`mixed_kind_program_still_verifies` and `int_chain_verifies`, plus
+`token_typed_value_op_rejected` from the fifth round). The check is
+one-directional by design — float-typed nodes consuming integer
+operands stay legal: mixed kinds fail loudly at execution
+(`RuntimeError::UnsupportedValue`) and mixed constant pairs fold via
+xir-graph's `const_f64_of` i64-to-f64 coercion; the runtime refusal is
+the observable behavior the tier differential tests pin. The e-graph
+application layer's conservative refusal remains as defense in depth.
+
+## Fifth audit round (session 3) and remediation
+
+An independent subagent audit of the session-3 increments (CI note,
+verifier element agreement, reduction-axis bounds) found 1×S1 soundness
+(reproduced), 2×S1 honesty, and S2/S3 documentation gaps. All remediated:
+
+- **S1-1 (reproduced tier divergence)**: `local_rules`' identity
+  elimination (`x+0→x`) was gated by the CONSTANT's kind, not the node's
+  element — a float-annotated add consuming `const.i64 0` fired the
+  identity, so Tier 2 deleted the trapping add while Tiers 0/1 failed
+  with `UnsupportedValue` (live repro: tier-0 error vs tier-2
+  `result[0]= 0.000000` on input −0.0; under promotion semantics it
+  would also flip −0.0 to +0.0). The identity block is now element-gated
+  (`is_int`, same discipline as annihilation): the unit regression
+  `mixed_kind_identity_excluded` pins the gate; the driver differential
+  `mixed_kind_failure_agrees_across_tiers` pins tier agreement ON
+  FAILURE; `tier2_egraph_identity_diverges_from_tier1` was re-anchored
+  on an i64-annotated fixture so the identity fires legitimately.
+- **S1-2 (fabricated contract)**: the increment's justification cited an
+  "interpreter's documented promotion contract" — no such contract
+  exists (mixed pairs hit the interpreter catch-all →
+  `RuntimeError::UnsupportedValue`; mixed CONSTANT pairs fold via
+  `const_f64_of` coercion). All claims rewritten to the real semantics
+  (verifier/rules comments, this catalog); the pre-push commit message
+  was reworded to match.
+- **S1-3 (false CI claim)**: the reference workflow's NOTE claimed the
+  live install was "pushed with a workflow-scoped credential" — the
+  push was rejected (no `workflow` scope) and the file sat uncommitted.
+  The NOTE now states the true state; waiver W-4 (.cep/waivers.md)
+  owns the CI-not-active gap with an expiry (34.7).
+- **S2 (stale ASSUMES)**: `local_rules`' elem-trust ASSUMES still said
+  "no operand/result type-agreement check exists yet" — updated to cite
+  `TypeDisagreement`.
+- **S2 (Token bypass)**: a Token-typed result on a value-producing op
+  passed `TypeInvalid` (which rejected only `Type::None`) and lifted
+  with `elem=None` — integer-eligible, bypassing the float-commute ban
+  by annotation. The verifier now rejects Token results on value ops
+  (`token_typed_value_op_rejected`).
+- S3s: standards citation in the CI NOTE corrected to Law 8;
+  `operand_elem_is_float` gained its CEP:WHY; `claims_integer_element`
+  COST corrected (branch table + 2 branches); the fourth-round bullet
+  now reads "(closed below)". The synthetic (NONE-input) pair shape of
+  `reduce_axis_out_of_range_rejected` was left as-is: `can_fuse` is a
+  pair-legality function and every reduction test in the module shares
+  that shape.
+
+The audit also confirmed clean: the reduction-axis bounds predicate is
+exact (and closes a latent `axis=255` u8-overflow panic), the
+element-agreement op coverage is a conservative superset of the ops
+that can reach integer-gated rewrites, first-error determinism (38.19)
+is preserved, and no false positives exist across the suite.
 
 ## Waivers
 
