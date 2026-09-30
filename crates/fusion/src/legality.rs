@@ -19,7 +19,8 @@
 // CEP:ASSUMES: verified input; tensor types present on tensor ops.
 // CEP:COST: O(arity) shape comparisons per candidate.
 // CEP:EVIDENCE: tests `elementwise_fuses`, `reduction_axis_blocked`,
-//           `barrier_blocks_fusion`, `shape_mismatch_rejected`.
+//           `barrier_blocks_fusion`, `shape_mismatch_rejected`,
+//           `reduce_axis_out_of_range_rejected`.
 // CEP:SECURITY: IR untrusted; explicit checks only.
 // CEP:HPC-PASS-LEGALITY: This module IS the legality proof source.
 // CEP:HPC-DETERMINISM: deterministic.
@@ -49,6 +50,10 @@ pub enum LegalityError {
     /// A reduction over the fused iteration axis would need an accumulator
     /// split (not proven legal here).
     ReductionAxisConflict,
+    /// The reduction axis is outside the producer's rank: the domain is
+    /// unproven (an out-of-range axis cannot index the producer's shape) —
+    /// rejected loudly rather than guessed (CEP&CC 38.22).
+    ReductionAxisInvalid,
     /// A fusion barrier sits between the candidates.
     BarrierBetween,
     /// One of the candidates has side effects (impure).
@@ -101,12 +106,18 @@ pub fn can_fuse(arena: &IrArena, p: NodeId, c: NodeId) -> Result<bool, LegalityE
     }
     // Reduction consumer: fusing into the producer's tile loop is legal
     // only for INNERMOST-axis reductions (row-wise accumulation inside one
-    // tile). Reducing a non-innermost axis requires cross-tile accumulators
-    // — the split-reduction strategy (Universe B), so the plain fuse is
-    // rejected here (documented subset; full Presburger analysis is
-    // CEP-19).
+    // tile). The axis must be IN RANGE first — an out-of-range axis has no
+    // provable iteration domain (38.22: transform only under proven
+    // legality; the interpreter would also refuse, but fusion must never
+    // bless the pair). In-range non-innermost axes require cross-tile
+    // accumulators — the split-reduction strategy (Universe B), so the
+    // plain fuse is rejected here (documented subset; full Presburger
+    // analysis is CEP-19).
     if let Op::Reduce { axis, .. } = cons.op {
         let producer_rank = p_shape.rank();
+        if u32::from(axis) >= u32::from(producer_rank) {
+            return Err(LegalityError::ReductionAxisInvalid);
+        }
         // The producer's result rank equals the reduction input rank; the
         // consumer's type is the reduced output. Reject when the reduced
         // axis is not the innermost axis of the producer's domain.
@@ -293,6 +304,36 @@ mod tests {
                 can_fuse(&a, p, c),
                 Err(LegalityError::ReductionAxisConflict)
             );
+        }
+    }
+
+    // CEP:WHAT: Out-of-range reduction axes are rejected (38.22 unproven
+    //           domain): axis 5 on a rank-2 producer previously returned
+    //           Ok(true) through the non-innermost arithmetic — the exact
+    //           silent-bless hole this regression pins.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on illegal acceptance.
+    // CEP:ASSUMES: none
+    // CEP:COST: test-only
+    // CEP:EVIDENCE: this test
+    #[test]
+    fn reduce_axis_out_of_range_rejected() {
+        let mut a = IrArena::with_capacity(16, 4);
+        let root = a.root_region();
+        let m = Node::new(Op::Param { index: 0 }, root, &[], tensor(&[4, 4]));
+        let mid = a.insert_node(root, m);
+        let red = Node::new(
+            Op::Reduce {
+                axis: 5,
+                monoid: xir_core::op::Monoid::Add,
+            },
+            root,
+            &[xir_core::id::ValueId::NONE],
+            tensor(&[4]),
+        );
+        let rid = a.insert_node(root, red);
+        if let (Ok(p), Ok(c)) = (mid, rid) {
+            assert_eq!(can_fuse(&a, p, c), Err(LegalityError::ReductionAxisInvalid));
         }
     }
 

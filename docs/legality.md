@@ -9,7 +9,9 @@ implemented subset (crates/fusion/src/legality.rs) is:
    rule) — the affine-compatible subset of index-map equality.
 4. **Reduction legality**: innermost-axis reductions fuse; non-innermost
    axes require the split-reduction strategy (Universe B inserts partials),
-   so plain fusion is rejected.
+   so plain fusion is rejected. Out-of-range axes are rejected as unproven
+   domains (`ReductionAxisInvalid`, CEP&CC 38.22) — an axis beyond the
+   producer's rank has no iteration domain to prove compatibility over.
 5. **Layout pricing**: mismatched layouts price a conversion term
    (`layout_conversion_cost`) rather than silently accepting.
 
