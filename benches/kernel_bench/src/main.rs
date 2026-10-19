@@ -2,16 +2,20 @@
 // CEP:WHAT: kernel_bench — the cross-system kernel benchmark harness:
 //           compiles the suite's XIR kernels at Tiers 0/1/2, executes them
 //           with deterministic LCG tensor inputs, times compilation and
-//           execution per tier, checks cross-tier BIT agreement, and (with
-//           --out) dumps inputs/results plus a manifest.json for the
-//           Python reference side (ref_xla.py: NumPy + JAX/XLA timings and
-//           value agreement).
+//           execution per tier (mean over the timed loop, plus min/max
+//           from a separate per-iteration sampled loop — CEP-28), checks
+//           cross-tier BIT agreement, and (with --out) dumps inputs/
+//           results plus a manifest.json for the Python reference side
+//           (ref_xla.py: NumPy + JAX/XLA timings and value agreement,
+//           conv included since CEP-28).
 // CEP:WHY: CEP&CC Law 4 (no unmeasured hot code): the Tier-0 interpreter
 //          kernels carried O(...) COST claims with no end-to-end
 //          measurement; this harness is that measurement. Also pins the
 //          tensor-parameter path (param : tensor<f64>[..]) end-to-end —
 //          the xla-run CLI binds scalar inputs only, so this path was
-//          compile-only-tested before this harness existed.
+//          compile-only-tested before this harness existed. The min/max
+//          statistics separate stable layout effects from scheduler
+//          noise on the shared box (docs/benchmarks.md finding 6).
 // CEP:CLASS: CEP-2
 // CEP:STATUS: complete
 // CEP:FAILURE: exit 2 on CLI misuse or debug-profile refusal (timings
@@ -20,16 +24,22 @@
 //              success.
 // CEP:ASSUMES: run via `cargo run --release --bin kernel_bench`; reference
 //              target per docs/targets.md; wall-clock timings are advisory
-//              evidence (never translation inputs); /proc/cpuinfo and
-//              `rustc -V` are environment DESCRIPTION inputs only (13.2).
-// CEP:COST: full suite ≈ tens of seconds in release (fixed iteration
-//           protocol in suite.rs); --scale 0.1 is the CI smoke protocol.
-//           One timed iteration = one full execute() call (value-table
-//           setup incl. input cloning + every instruction) — the Tier-0
-//           dispatch contract, measured as shipped.
+//              evidence (never translation inputs); min/max samples carry
+//              ~2 clock reads (~50ns) of instrumentation overhead — the
+//              mean loop stays un-instrumented (protocol unchanged from
+//              the 2026-10-19 run, so means stay comparable); /proc/cpuinfo
+//              and `rustc -V` are environment DESCRIPTION inputs only
+//              (13.2).
+// CEP:COST: full suite ≈ a minute in release (fixed iteration protocol
+//           in suite.rs; the sampled loop doubles execution); --scale 0.1
+//           is the CI smoke protocol. One timed iteration = one full
+//           execute() call (value-table setup incl. input cloning + every
+//           instruction) — the Tier-0 dispatch contract, measured as
+//           shipped.
 // CEP:EVIDENCE: docs/benchmarks.md; .cep/evidence/kernel-bench-*.txt;
 //           suite.rs unit tests (LCG golden vector, per-class known
-//           values, tier bit agreement, CSE demonstrator).
+//           values incl. conv padding/stride conventions, tier bit
+//           agreement, CSE demonstrator).
 // CEP:SECURITY: no network; files written only under --out.
 // CEP:HPC-DETERMINISM: VALUE fields (dumps, checksums, fingerprints,
 //           instr counts) are bit-reproducible; TIMING fields are
@@ -185,9 +195,12 @@ fn date_stamp(arg: Option<&str>) -> String {
 /// CEP:WHAT: Per-tier measurement record (one kernel, one tier).
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none (plain data)
-/// CEP:ASSUMES: single-shot compile; mean over the timed loop.
+/// CEP:ASSUMES: single-shot compile; mean over the un-instrumented timed
+///              loop; min/max over a separate per-iteration sampled loop
+///              (CEP-28) whose samples carry ~2 clock reads (~50ns) of
+///              instrumentation overhead — advisory only.
 /// CEP:COST: n/a
-/// CEP:EVIDENCE: manifest tier objects.
+/// CEP:EVIDENCE: manifest tier objects (exec_ns_mean/min/max).
 struct TierRow {
     /// Tier code (0/1/2).
     code: u64,
@@ -197,8 +210,13 @@ struct TierRow {
     instrs: usize,
     /// Program fingerprint (hex).
     fingerprint: String,
-    /// Mean execution wall time per execute() call, nanoseconds.
+    /// Mean execution wall time per execute() call, nanoseconds
+    /// (un-instrumented loop; protocol unchanged since the first run).
     exec_ns_mean: f64,
+    /// Minimum per-iteration sample, nanoseconds (sampled loop).
+    exec_ns_min: f64,
+    /// Maximum per-iteration sample, nanoseconds (sampled loop).
+    exec_ns_max: f64,
 }
 
 fn main() -> ExitCode {
@@ -251,6 +269,8 @@ fn main() -> ExitCode {
             "--help" | "-h" => {
                 println!("kernel_bench [--out DIR] [--scale F] [--date TEXT]");
                 println!("  Times the kernel suite at Tiers 0/1/2 (release profile).");
+                println!("  Per tier: compile_us, exec mean/min/max ns (min/max from a");
+                println!("  per-iteration sampled loop; the mean loop is un-instrumented).");
                 println!("  --out DIR   also write manifest.json + input/result dumps there");
                 println!("  --scale F   scale all iteration counts by F (CI smoke: 0.1)");
                 println!("  --date TEXT artifact date stamp (else SOURCE_DATE_EPOCH/now)");
@@ -285,8 +305,17 @@ fn main() -> ExitCode {
     );
     println!("date: {} | profile: release per Cargo.toml (lto, cgu=1, overflow-checks on; debug_assertions off — guard passed)", date);
     println!(
-        "{:<16} {:<12} {:>10} {:>4} {:>6} {:>10} {:>12} {:>9}",
-        "kernel", "class", "work", "tier", "instrs", "compile_us", "exec_ns_mean", "ns/work"
+        "{:<16} {:<12} {:>10} {:>4} {:>6} {:>10} {:>12} {:>12} {:>12} {:>9}",
+        "kernel",
+        "class",
+        "work",
+        "tier",
+        "instrs",
+        "compile_us",
+        "exec_ns_mean",
+        "exec_ns_min",
+        "exec_ns_max",
+        "ns/work"
     );
 
     let kernels = suite();
@@ -349,26 +378,53 @@ fn main() -> ExitCode {
                 std::hint::black_box(&r);
             }
             let mean_ns = start.elapsed().as_nanos() as f64 / iters as f64;
+            // CEP-28: per-iteration sampled loop for min/max. Separate
+            // from the mean loop so the mean stays free of timer overhead
+            // (comparable with the archived runs); each sample carries
+            // ~2 clock reads (~50ns) — negligible above ~1us kernels and
+            // documented in the manifest's methodology note.
+            let mut sample_min = f64::MAX;
+            let mut sample_max = 0.0f64;
+            for _ in 0..iters {
+                let t = Instant::now();
+                let r = execute(&compiled.target, &inputs);
+                std::hint::black_box(&r);
+                let ns = t.elapsed().as_nanos() as f64;
+                if ns < sample_min {
+                    sample_min = ns;
+                }
+                if ns > sample_max {
+                    sample_max = ns;
+                }
+            }
             rows.push(TierRow {
                 code: t.code(),
                 compile_us,
                 instrs: compiled.target.instrs.len(),
                 fingerprint: format!("{:016x}", compiled.fingerprint),
                 exec_ns_mean: mean_ns,
+                exec_ns_min: sample_min,
+                exec_ns_max: sample_max,
             });
         }
         let ns_per_work = |row: &TierRow| row.exec_ns_mean / k.work.max(1) as f64;
         for row in &rows {
             println!(
-                "{:<16} {:<12} {:>9}{} {:>4} {:>6} {:>10.1} {:>12.0} {:>9.3}",
+                "{:<16} {:<12} {:>9}{} {:>4} {:>6} {:>10.1} {:>12.0} {:>12.0} {:>12.0} {:>9.3}",
                 k.name,
                 k.class,
                 k.work,
-                if k.class == "matmul" { 'f' } else { 'e' },
+                if k.class == "matmul" || k.class == "conv" {
+                    'f'
+                } else {
+                    'e'
+                },
                 row.code,
                 row.instrs,
                 row.compile_us,
                 row.exec_ns_mean,
+                row.exec_ns_min,
+                row.exec_ns_max,
                 ns_per_work(row),
             );
         }
@@ -418,22 +474,35 @@ fn main() -> ExitCode {
             .iter()
             .map(|r| {
                 format!(
-                    "{{\"compile_us\":{:.1},\"instrs\":{},\"fingerprint\":{},\"exec_ns_mean\":{:.1},\"ns_per_work\":{:.4}}}",
+                    "{{\"compile_us\":{:.1},\"instrs\":{},\"fingerprint\":{},\"exec_ns_mean\":{:.1},\"exec_ns_min\":{:.1},\"exec_ns_max\":{:.1},\"ns_per_work\":{:.4}}}",
                     r.compile_us,
                     r.instrs,
                     jesc(&r.fingerprint),
                     r.exec_ns_mean,
+                    r.exec_ns_min,
+                    r.exec_ns_max,
                     ns_per_work(r)
                 )
             })
             .collect();
+        let conv_json = match k.conv {
+            Some((padding, stride)) => {
+                format!("{{\"padding\":{},\"stride\":{}}}", jesc(padding), stride)
+            }
+            None => "null".to_string(),
+        };
         kernel_json.push(format!(
-            "{{\"name\":{},\"class\":{},\"iters\":{},\"work\":{},\"work_kind\":{},\"dump\":{},\"params\":[{}],\"result\":{{\"dims\":{:?},\"elems\":{},\"file\":{}}},\"tiers\":{{\"0\":{},\"1\":{},\"2\":{}}},\"checksum\":\"{:016x}\"}}",
+            "{{\"name\":{},\"class\":{},\"iters\":{},\"work\":{},\"work_kind\":{},\"conv\":{},\"dump\":{},\"params\":[{}],\"result\":{{\"dims\":{:?},\"elems\":{},\"file\":{}}},\"tiers\":{{\"0\":{},\"1\":{},\"2\":{}}},\"checksum\":\"{:016x}\"}}",
             jesc(&k.name),
             jesc(k.class),
             iters,
             k.work,
-            jesc(if k.class == "matmul" { "fma" } else { "elem" }),
+            jesc(if k.class == "matmul" || k.class == "conv" {
+                "fma"
+            } else {
+                "elem"
+            }),
+            conv_json,
             k.dump,
             param_json.join(","),
             k.result_dims,
@@ -451,12 +520,13 @@ fn main() -> ExitCode {
     }
     if let Some(dir) = &out_dir {
         let manifest = format!(
-            "{{\"harness\":\"sxla-kernel-bench\",\"version\":\"0.1.0\",\"date\":{},\"profile\":{},\"rustc\":{},\"cpu\":{},\"cores\":{},\"lcg\":{{\"mul\":{},\"add\":{},\"seed0\":{},\"formula\":{}}},\"kernels\":[{}]}}\n",
+            "{{\"harness\":\"sxla-kernel-bench\",\"version\":\"0.2.0\",\"date\":{},\"profile\":{},\"rustc\":{},\"cpu\":{},\"cores\":{},\"timing\":{},\"lcg\":{{\"mul\":{},\"add\":{},\"seed0\":{},\"formula\":{}}},\"kernels\":[{}]}}\n",
             jesc(&date),
             jesc("release (lto, codegen-units=1, overflow-checks=true; debug_assertions off)"),
             jesc(&rustc),
             jesc(&cpu),
             cores,
+            jesc("mean over the un-instrumented timed loop; min/max from a separate per-iteration sampled loop (samples carry ~50ns of timer overhead; advisory)"),
             jesc(&LCG_MUL.to_string()),
             jesc(&LCG_ADD.to_string()),
             jesc(&LCG_SEED0.to_string()),

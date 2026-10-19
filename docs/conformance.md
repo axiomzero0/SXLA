@@ -67,7 +67,7 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Strided/block layouts | placeholder | CEP-7 |
 | Conv interpreter kernel | complete (naive NCHW/FCHW reference; valid/same/stride) | closed |
 | CI sanitizer matrix | partial (workflow present; nightly TSan gated) | CEP-27 |
-| Conv kernel cross-system bench; timing min/max stats | stub (suite covers elementwise/reduction/dot/matmul) | CEP-28 |
+| Conv kernel cross-system bench; timing min/max stats | done (session 4: 3 conv kernels cross-checked vs NumPy/XLA with semantics-matched explicit padding; per-iteration min/max in both harness and reference) | closed CEP-28 |
 
 ## Second audit round (session 2) and remediation
 
@@ -236,6 +236,29 @@ and the NOTE states the keep-in-sync rule (edit the reference first,
 then mirror). The `--scale 0.1` kernel-bench step is Rust-side only —
 CI runners have no jax; the cross-system NumPy/XLA comparison stays a
 reference-target activity (docs/benchmarks.md, reproduction section).
+
+## Kernel bench CEP-28 (session 4)
+
+CEP-28 closed: the cross-system suite gained the conv class (three
+kernels: valid/stride-1, valid/stride-2, same/stride-2 with the odd
+padding pixel bottom/right) and per-iteration min/max timing statistics
+in both the Rust harness and the Python reference (the un-instrumented
+mean protocol is unchanged, so means stay comparable with the archived
+runs). The Python side matches SXLA's conv semantics exactly — explicit
+padding lists computed from the interpreter's own formula plus
+("NCHW", "OIHW", "NCHW") dimension numbers — so cross-system value
+disagreement can only be summation order; observed 2e-13..7e-12, with
+all three systems the same distance from exact fsum ground truth. Two
+suite known-value tests pin the padding/stride conventions against
+hand-computed values cross-verified against XLA before pinning (the
+odd-pixel case would read 68 instead of 54 under a top/left split).
+Min/max answered the open layout question: the ew_chain_1024
+tier-0-vs-tier-1 gap is a stable layout effect (mins 7.81ms vs 5.51ms,
+tight spreads), while XLA's tiny-kernel maxima hit 24-26ms dispatch
+outliers. Evidence: .cep/evidence/kernel-bench-2026-10-20.txt;
+docs/benchmarks.md carries the full tables and the conv disassembly
+excerpt (scalar tap loop, overflow-checked indices, per-tap bounds
+checks).
 
 ## Waivers
 

@@ -1,0 +1,152 @@
+# SXLA kernel_bench evidence — 2026-10-20 (CEP-28: conv class + per-iteration min/max)
+# Law 4 checklist: results, target, compiler, flags, input description, date,
+# disassembly excerpts (below). Protocol: warmup 10% + un-instrumented timed
+# mean (unchanged from the 2026-10-19 run) + a separate per-iteration sampled
+# loop for min/max (samples carry ~2 clock reads, ~50ns Rust / ~150ns Python;
+# advisory). Prior run archived at kernel-bench-2026-10-19.txt. This run was
+# produced by the committed code (post ConvSpec refactor; checksums identical
+# to the pre-refactor binary).
+
+sxla kernel bench — rustc 1.98.1 (48a229cea 2026-09-01) | Intel(R) Xeon(R) Processor | x86_64 linux | cores=2
+date: 2026-10-20 | profile: release per Cargo.toml (lto, cgu=1, overflow-checks on; debug_assertions off — guard passed)
+kernel           class              work tier instrs compile_us exec_ns_mean  exec_ns_min  exec_ns_max   ns/work
+ew_chain_64      elementwise       4096e    0      5       53.8         9752         9435        28808     2.381
+ew_chain_64      elementwise       4096e    1      5      103.1        12009         9435        21680     2.932
+ew_chain_64      elementwise       4096e    2      5      632.9        10022         9508        21580     2.447
+ew_chain_256     elementwise      65536e    0      5       30.2       231166       217848       320067     3.527
+ew_chain_256     elementwise      65536e    1      5      171.2       231428       217751       318786     3.531
+ew_chain_256     elementwise      65536e    2      5      399.8       226329       217026       298236     3.454
+ew_chain_1024    elementwise    1048576e    0      5       31.0      8688954      7813204      8626006     8.286
+ew_chain_1024    elementwise    1048576e    1      5       52.2      5800001      5505605      6222669     5.531
+ew_chain_1024    elementwise    1048576e    2      5      375.2      5761551      5500198      5925218     5.495
+ew_cse_256       elementwise      65536e    0      4       29.7       240286       222896       307592     3.666
+ew_cse_256       elementwise      65536e    1      3       66.3       158710       151668       233487     2.422
+ew_cse_256       elementwise      65536e    2      3      357.6       158645       151501       222904     2.421
+reduce_sum_64    reduction         4096e    0      1       20.3         5499         5288        23829     1.342
+reduce_sum_64    reduction         4096e    1      1       26.5         5461         5285        11305     1.333
+reduce_sum_64    reduction         4096e    2      1      297.7         5459         5282        13240     1.333
+reduce_sum_256   reduction        65536e    0      1       10.2        85804        82473       136832     1.309
+reduce_sum_256   reduction        65536e    1      1       32.0        86137        82383       117523     1.314
+reduce_sum_256   reduction        65536e    2      1      417.7        87179        82335       140772     1.330
+reduce_sum_1024  reduction      1048576e    0      1       27.5     11002593     10433810     12129334    10.493
+reduce_sum_1024  reduction      1048576e    1      1       40.0     11125882     10292493     12083828    10.610
+reduce_sum_1024  reduction      1048576e    2      1      333.7     11208759     10364925     16753652    10.690
+dot_1024         dot               1024e    0      1       20.2         1191         1182         8226     1.163
+dot_1024         dot               1024e    1      1       27.9         1204         1181        10851     1.176
+dot_1024         dot               1024e    2      1      335.9         1198         1181         9949     1.170
+dot_4096         dot               4096e    0      1       14.6         5351         5241        12319     1.306
+dot_4096         dot               4096e    1      1       15.9         5353         5231        12338     1.307
+dot_4096         dot               4096e    2      1      292.5         7024         5239        12978     1.715
+dot_16384        dot              16384e    0      1       14.6        21052        20730        30371     1.285
+dot_16384        dot              16384e    1      1       14.4        21148        20747        27904     1.291
+dot_16384        dot              16384e    2      1      314.8        21076        20638        47209     1.286
+matmul_64        matmul          262144f    0      1       14.3       269268       262232       314436     1.027
+matmul_64        matmul          262144f    1      1       32.7       268962       261959       303718     1.026
+matmul_64        matmul          262144f    2      1      373.4       269864       261893       359511     1.029
+matmul_128       matmul         2097152f    0      1       21.3      1986210      1967214      1995629     0.947
+matmul_128       matmul         2097152f    1      1       28.6      1999869      1966576      2257121     0.954
+matmul_128       matmul         2097152f    2      1      333.8      1997253      1967673      2050931     0.952
+matmul_256       matmul        16777216f    0      1       18.4     16697878     16642599     16841673     0.995
+matmul_256       matmul        16777216f    1      1       33.2     17589710     16658279     17206360     1.048
+matmul_256       matmul        16777216f    2      1      323.3     16673797     16617159     16887038     0.994
+conv_valid_32    conv           1036800f    0      1       27.5      3037383      2964609      3698661     2.930
+conv_valid_32    conv           1036800f    1      1       32.5      3238673      2956687      3190431     3.124
+conv_valid_32    conv           1036800f    2      1      353.9      3034757      2944268      3124615     2.927
+conv_valid_s2_32 conv            259200f    0      1       22.4       772006       718195      1026221     2.978
+conv_valid_s2_32 conv            259200f    1      1       42.0       766889       726127       955165     2.959
+conv_valid_s2_32 conv            259200f    2      1      356.5       771333       726424       847582     2.976
+conv_same_s2_16  conv             18432f    0      1       32.4        53291        49129        80035     2.891
+conv_same_s2_16  conv             18432f    1      1       32.1        53071        48775        62278     2.879
+conv_same_s2_16  conv             18432f    2      1      367.9        52961        49120        73169     2.873
+manifest + dumps written to /home/z/my-project/download/sxla-bench-2026-10-20
+done. all tiers agree bitwise across the suite.
+
+ref_xla — python 3.12.14 | numpy 2.5.4 | jax 0.12.0 (cpu, x64=True) | Intel(R) Xeon(R) Processor | cores=2
+kernel           class        inputs=bits  sxla~np            sxla~xla           exact-err(sxla/np/xla)  
+ew_chain_64      elementwise  OK           bits:0.00e+00      bits:0.00e+00      -
+ew_cse_256       elementwise  OK           bits:0.00e+00      bits:0.00e+00      -
+reduce_sum_64    reduction    OK           bits:0.00e+00      bits:0.00e+00      0.00e+00/0.00e+00/0.00e+00
+reduce_sum_1024  reduction    OK           bits:0.00e+00      bits:0.00e+00      0.00e+00/0.00e+00/0.00e+00
+dot_1024         dot          OK           rel:1.46e-16       rel:7.31e-16       1.46e-16/2.92e-16/5.85e-16
+dot_16384        dot          OK           rel:6.49e-16       rel:3.24e-16       3.24e-16/3.24e-16/0.00e+00
+matmul_64        matmul       OK           rel:1.18e-12       rel:1.18e-12       -
+matmul_128       matmul       OK           rel:3.24e-12       rel:3.24e-12       -
+matmul_256       matmul       OK           rel:5.72e-12       rel:5.72e-12       -
+conv_valid_32    conv         OK           rel:4.00e-12       rel:3.37e-12       8.47e-12/1.25e-11/5.10e-12
+conv_valid_s2_32 conv         OK           rel:1.59e-13       rel:1.97e-13       1.50e-13/2.14e-13/1.63e-13
+conv_same_s2_16  conv         OK           rel:8.13e-13       rel:6.99e-12       6.18e-12/5.37e-12/1.32e-11
+results written to /home/z/my-project/download/sxla-bench-2026-10-20/xla_results.json
+
+kernel              sxla t0    sxla t2      numpy  jax eager    xla jit   t2/jit
+ew_chain_64            9752      10022       4977      71070      20999      0.5
+ew_cse_256           240286     158645      53514     615666      95358      1.7
+reduce_sum_64          5499       5459       3640      29283      30685      0.2
+reduce_sum_1024    11002593   11208759     431355     412124     372102     30.1
+dot_1024               1191       1198        880      29348      28500      0.0
+dot_16384             21052      21076       3503      46908      26775      0.8
+matmul_64            269268     269864       9054      48481      36434      7.4
+matmul_128          1986210    1997253      79947     148061     108746     18.4
+matmul_256         16697878   16673797     371226     603327     615346     27.1
+conv_valid_32       3037383    3034757     286210     379064     369965      8.2
+conv_valid_s2_32     772006     771333     188054     202356     177357      4.3
+conv_same_s2_16       53291      52961      92003      77193      41463      1.3
+
+kernel                 sxla t2 min..max         numpy min..max       xla jit min..max
+ew_chain_64                 9508..21580            4833..26946         8268..24279973
+ew_cse_256               151501..222904          46040..103177           27512..87254
+reduce_sum_64               5282..13240         3598..13273262        12685..25355900
+reduce_sum_1024      10364925..16753652         402613..483067         266870..373133
+dot_1024                     1181..9949             893..16194        10498..26335477
+dot_16384                  20638..47209            3181..26998        23912..20318731
+matmul_64                261893..359511            8637..20988          27998..107120
+matmul_128             1967673..2050931           60868..94029          72114..197651
+matmul_256           16617159..16887038         343956..382841         560452..586716
+conv_valid_32          2944268..3124615         235977..377372         291009..567724
+conv_valid_s2_32         726424..847582         142200..243877          95439..292676
+conv_same_s2_16            49120..73169          79258..160448          23969..152078
+ref_xla: all input bit-checks and tolerance gates passed.
+
+# --- disassembly: runtime::interp::run_instr (release, lto, cgu=1) ---
+# conv tap loop (scalar mulsd+addsd per tap, overflow-checked index math
+# (imul+jo), bounds checks (cmp+jae) per tap — the padding-bounds guard
+# compiled into the loop; no SIMD, unlike dot):
+   5aef0:\tmov    %r8,%rcx
+   5aef3:\timul   %rbx,%rcx
+   5aef7:\tjo     5c89d <runtime::interp::run_instr+0x4ffd>
+   5aefd:\tadd    %rsi,%rcx
+   5af00:\tjo     5c424 <runtime::interp::run_instr+0x4b84>
+   5af06:\tcmp    %r14,%rcx
+   5af09:\tjae    5c3f2 <runtime::interp::run_instr+0x4b52>
+   5af0f:\tmov    %r13,%rdx
+   5af12:\tadd    %r8,%rdx
+   5af15:\tjo     5c424 <runtime::interp::run_instr+0x4b84>
+   5af1b:\tcmp    %rbp,%rdx
+   5af1e:\tjae    5c3f7 <runtime::interp::run_instr+0x4b57>
+   5af24:\tinc    %r8
+   5af27:\tmov    0xa0(%rsp),%r10
+   5af2f:\tmovsd  (%r10,%rcx,8),%xmm1
+   5af35:\tmulsd  (%r12,%rdx,8),%xmm1
+   5af3b:\taddsd  %xmm1,%xmm0
+   5af3f:\tcmp    %r8,%r15
+   5af42:\tjne    5aef0 <runtime::interp::run_instr+0x3650>
+# matmul inner loop (scalar mulsd+addsd, loop-carried acc, overflow-checked
+# indices) — unchanged from the prior run's excerpt:
+   5a764:\tinc    %rcx
+   5a767:\tmov    0xa0(%rsp),%rdx
+   5a76f:\tmovsd  (%rdx,%r10,8),%xmm1
+   5a775:\tmulsd  (%r12,%r8,8),%xmm1
+   5a77b:\taddsd  %xmm1,%xmm0
+   5a77f:\tcmp    %rcx,%r15
+   5a782:\tjne    5a730 <runtime::interp::run_instr+0x4660>
+# dot kernel loop (2-wide SSE mulpd + scalar tail; auto-vectorized):
+   585bf:\tmovupd 0x8(%rdx,%rcx,8),%xmm1
+   585c5:\tmovupd 0x8(%rdi,%rcx,8),%xmm2
+   585cb:\tmulpd  %xmm1,%xmm2
+   585cf:\taddsd  %xmm2,%xmm0
+   585d3:\tunpckhpd %xmm2,%xmm2
+   585eb:\taddsd  %xmm2,%xmm1
+   585ef:\tcmp    %rcx,%r15
+   585f2:\tjne    585b1 <runtime::interp::run_instr+0x24e1>
+
+# dumps + manifest + xla_results.json: NOT committed (bit-reproducible);
+# regenerate via the reproduction commands in docs/benchmarks.md

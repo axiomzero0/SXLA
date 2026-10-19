@@ -2,8 +2,12 @@
 # CEP:FILE: benches/kernel_bench/ref_xla.py
 # CEP:WHAT: Python reference side of the cross-system kernel benchmark:
 #           re-generates the LCG inputs, bit-checks them against the Rust
-#           harness dumps, times NumPy / JAX eager / JAX jit (XLA), and
-#           checks value agreement against the SXLA result dumps.
+#           harness dumps, times NumPy / JAX eager / JAX jit (XLA) — mean
+#           over the un-instrumented loop plus per-iteration min/max
+#           samples (CEP-28) — and checks value agreement against the
+#           SXLA result dumps, conv included (CEP-28: explicit
+#           TF-formula padding + NCHW/OIHW dimension numbers, matching
+#           the SXLA interpreter's conventions bit-for-bit).
 # CEP:WHY: CEP&CC Law 4 (measurement evidence) + cross-system value
 #          agreement: the Rust workspace stays zero-dependency (22.11),
 #          so the reference systems run here instead. This file is not
@@ -16,7 +20,8 @@
 # CEP:ASSUMES: numpy present; jax present unless --skip-jax; jax x64
 #              enabled at import; run against a kernel_bench --out dump
 #              directory produced on the same target.
-# CEP:COST: seconds (LCG regeneration dominates for 1M-element dumps).
+# CEP:COST: seconds (LCG regeneration dominates for 1M-element dumps;
+#           the conv fsum ground truth adds a few more).
 # CEP:EVIDENCE: docs/benchmarks.md; xla_results.json written to --dir.
 # CEP:SECURITY: reads only the harness's own dumps/manifest.
 # CEP:HPC-DETERMINISM: input regeneration and agreement checks are
@@ -27,10 +32,18 @@
 Tolerance policy (documented, not ad hoc):
 - elementwise kernels: IEEE per-element ops agree bitwise OR within one
   contraction (FMA) step -> assert max_rel_err <= 1e-12, report bitexact.
-- reduction/dot/matmul: summation ORDER differs between the sequential
+- reduction/dot/matmul/conv: summation ORDER differs between the sequential
   left-to-right SXLA fold and pairwise/SIMD reference folds -> assert
   max_rel_err <= 1e-9, report the observed value and the error of every
   system against an exact (math.fsum) ground truth where computable.
+
+Conv semantics matching (CEP-28): SXLA's NCHW x OIHW conv follows the
+TF/XLA conventions — valid output size floor((h-kh)/s)+1 == TF's
+ceil((h-kh+1)/s); same pads (oh-1)*s+kh-h total with a floor split, odd
+pixel bottom/right. The reference passes EXPLICIT padding lists computed
+from that formula to XLA's conv_general_dilated with dimension numbers
+("NCHW", "OIHW", "NCHW"), so any disagreement can only be summation
+order, never padding/stride semantics.
 """
 
 import argparse
@@ -39,6 +52,7 @@ import math
 import os
 import sys
 import time
+from numpy.lib.stride_tricks import sliding_window_view
 
 import numpy as np
 
@@ -95,7 +109,32 @@ def bitexact(a: np.ndarray, b: np.ndarray) -> bool:
     return bool(np.array_equal(a.view(np.uint64), b.view(np.uint64)))
 
 
-def numpy_impl(name: str, cls: str, xs):
+def conv_pads(padding: str, stride: int, x_shape, w_shape):
+    """Explicit NCHW padding pairs [(pt, pb), (pl, pr)] from the SXLA/TF
+    formula (see module docstring): same pads (oh-1)*s+kh-h total,
+    floor split, odd pixel bottom/right; valid pads nothing."""
+    _, _, h, w = x_shape[:4]
+    _, _, kh, kw = w_shape[:4]
+    if padding == "valid":
+        return [(0, 0), (0, 0)]
+    oh = (h + stride - 1) // stride
+    ow = (w + stride - 1) // stride
+    ph = max((oh - 1) * stride + kh - h, 0)
+    pw = max((ow - 1) * stride + kw - w, 0)
+    return [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2)]
+
+
+def conv_windows(x: np.ndarray, w: np.ndarray, conv: dict):
+    """Strided sliding windows of the padded NCHW input; shape
+    (n, c, oh, ow, kh, kw) with oh/ow exactly the SXLA output sizes."""
+    s = int(conv["stride"])
+    pads = conv_pads(conv["padding"], s, x.shape, w.shape)
+    kh, kw = int(w.shape[2]), int(w.shape[3])
+    xp = np.pad(x, ((0, 0), (0, 0), pads[0], pads[1]))
+    return sliding_window_view(xp, (kh, kw), axis=(2, 3))[:, :, ::s, ::s]
+
+
+def numpy_impl(name: str, cls: str, xs, conv=None):
     if cls == "elementwise":
         x = xs[0]
         if name.startswith("ew_chain"):
@@ -105,21 +144,39 @@ def numpy_impl(name: str, cls: str, xs):
         return np.sum(xs[0], axis=0)
     if cls == "dot":
         return np.dot(xs[0], xs[1])
+    if cls == "conv":
+        wins = conv_windows(xs[0], xs[1], conv)
+        return np.einsum("nchwij,ocij->nohw", wins, xs[1], optimize=True)
     return xs[0] @ xs[1]
 
 
-def fsum_exact(cls: str, xs):
-    """Exact ground truth where computable (reduction, dot)."""
+def fsum_exact(cls: str, xs, conv=None):
+    """Exact ground truth where computable (reduction, dot, conv)."""
     if cls == "reduction":
         x = xs[0]
         return np.array([math.fsum(x[:, j]) for j in range(x.shape[1])])
     if cls == "dot":
         return np.array([math.fsum(xs[0] * xs[1])])
+    if cls == "conv":
+        wins = conv_windows(xs[0], xs[1], conv)
+        n, c, oh, ow = wins.shape[0], wins.shape[1], wins.shape[2], wins.shape[3]
+        f = xs[1].shape[0]
+        out = np.empty((n, f, oh, ow))
+        for b in range(n):
+            for o in range(f):
+                fo = xs[1][o]
+                for iy in range(oh):
+                    for ix in range(ow):
+                        out[b, o, iy, ix] = math.fsum(
+                            (wins[b, :, iy, ix] * fo).ravel()
+                        )
+        return out
     return None
 
 
 def time_fn(fn, iters: int) -> float:
-    """House timing protocol: warmup 10%, mean over the timed loop (ns)."""
+    """House timing protocol: warmup 10%, mean over the timed loop (ns).
+    Un-instrumented loop — unchanged since the first evidence run."""
     warm = iters // 10 + 1
     for _ in range(warm):
         fn()
@@ -127,6 +184,25 @@ def time_fn(fn, iters: int) -> float:
     for _ in range(iters):
         fn()
     return (time.perf_counter() - t0) * 1e9 / iters
+
+
+def time_fn_minmax(fn, iters: int):
+    """CEP-28: per-iteration samples -> (min, max) ns. Samples carry ~2
+    perf_counter reads (~150ns) of instrumentation; the mean stays from
+    time_fn's un-instrumented loop (documented, advisory)."""
+    warm = iters // 10 + 1
+    for _ in range(warm):
+        fn()
+    lo, hi = float("inf"), 0.0
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        fn()
+        dt = (time.perf_counter() - t0) * 1e9
+        if dt < lo:
+            lo = dt
+        if dt > hi:
+            hi = dt
+    return lo, hi
 
 
 def main() -> int:
@@ -153,7 +229,7 @@ def main() -> int:
             print("ref_xla: jax unavailable — numpy-only mode", file=sys.stderr)
             have_jax = False
 
-    def jax_impl(name: str, cls: str, xs):
+    def jax_impl(name: str, cls: str, xs, conv=None):
         if cls == "elementwise":
             x = xs[0]
             if name.startswith("ew_chain"):
@@ -163,6 +239,21 @@ def main() -> int:
             return jnp.sum(xs[0], axis=0)
         if cls == "dot":
             return jnp.dot(xs[0], xs[1])
+        if cls == "conv":
+            # CEP-28: semantics-matched reference — explicit padding from
+            # the SXLA/TF formula, NCHW/OIHW dimension numbers. Any value
+            # disagreement is then summation order only (module docstring).
+            import jax.lax as lax
+
+            s = int(conv["stride"])
+            pads = conv_pads(conv["padding"], s, xs[0].shape, xs[1].shape)
+            return lax.conv_general_dilated(
+                xs[0],
+                xs[1],
+                window_strides=(s, s),
+                padding=[(int(p[0]), int(p[1])) for p in pads],
+                dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            )
         return xs[0] @ xs[1]
 
     env = {
@@ -202,6 +293,7 @@ def main() -> int:
         if not k.get("dump") or not k.get("result", {}).get("file"):
             continue
         name, cls, iters = k["name"], k["class"], int(k["iters"])
+        conv = k.get("conv")
         # Regenerate inputs and bit-check against the dumps.
         xs, inputs_ok = [], True
         for pi, p in enumerate(k["params"]):
@@ -228,7 +320,7 @@ def main() -> int:
         sx = sx.reshape(rdims) if rdims else sx
 
         # NumPy reference.
-        np_res = numpy_impl(name, cls, xs)
+        np_res = numpy_impl(name, cls, xs, conv)
         agree_np = {
             "bitexact": bitexact(np_res, sx),
             "max_rel_err": max_rel_err(np_res, sx),
@@ -241,12 +333,15 @@ def main() -> int:
         jax_rows = {}
         if have_jax:
             xs_j = [jnp.asarray(x) for x in xs]
-            eager_res = jax_impl(name, cls, xs_j)
+            eager_res = jax_impl(name, cls, xs_j, conv)
             eager_res.block_until_ready()
             jax_rows["eager_ns"] = time_fn(
-                lambda: jax_impl(name, cls, xs_j).block_until_ready(), iters
+                lambda: jax_impl(name, cls, xs_j, conv).block_until_ready(), iters
             )
-            jitted = jax.jit(lambda *a: jax_impl(name, cls, list(a)))
+            jax_rows["eager_ns_min"], jax_rows["eager_ns_max"] = time_fn_minmax(
+                lambda: jax_impl(name, cls, xs_j, conv).block_until_ready(), iters
+            )
+            jitted = jax.jit(lambda *a: jax_impl(name, cls, list(a), conv))
             t0 = time.perf_counter()
             jit_res = jitted(*xs_j)
             jit_res.block_until_ready()
@@ -256,13 +351,16 @@ def main() -> int:
             )
             jax_rows["jit_compile_ms"] = compile_ms
             jax_rows["jit_ns"] = jit_ns
+            jax_rows["jit_ns_min"], jax_rows["jit_ns_max"] = time_fn_minmax(
+                lambda: jitted(*xs_j).block_until_ready(), iters
+            )
             agree_jit = {
                 "bitexact": bitexact(np.asarray(jit_res), sx),
                 "max_rel_err": max_rel_err(np.asarray(jit_res), sx),
             }
 
         # Exact ground truth where computable.
-        exact = fsum_exact(cls, xs)
+        exact = fsum_exact(cls, xs, conv)
         exact_errs = None
         if exact is not None:
             exact_errs = {
@@ -283,19 +381,30 @@ def main() -> int:
                 )
                 failures.append(f"tolerance:{name}:{label}")
 
-        np_ns = time_fn(lambda: numpy_impl(name, cls, xs), iters)
+        np_ns = time_fn(lambda: numpy_impl(name, cls, xs, conv), iters)
+        np_min, np_max = time_fn_minmax(
+            lambda: numpy_impl(name, cls, xs, conv), iters
+        )
         row = {
             "name": name,
             "class": cls,
             "iters": iters,
             "numpy_ns": np_ns,
+            "numpy_ns_min": np_min,
+            "numpy_ns_max": np_max,
             "jax_eager_ns": jax_rows.get("eager_ns"),
+            "jax_eager_ns_min": jax_rows.get("eager_ns_min"),
+            "jax_eager_ns_max": jax_rows.get("eager_ns_max"),
             "jax_jit_ns": jax_rows.get("jit_ns"),
+            "jax_jit_ns_min": jax_rows.get("jit_ns_min"),
+            "jax_jit_ns_max": jax_rows.get("jit_ns_max"),
             "jax_jit_compile_ms": jax_rows.get("jit_compile_ms"),
             "sxla_ns": {
                 "t0": k["tiers"]["0"]["exec_ns_mean"],
                 "t1": k["tiers"]["1"]["exec_ns_mean"],
                 "t2": k["tiers"]["2"]["exec_ns_mean"],
+                "t2_min": k["tiers"]["2"].get("exec_ns_min"),
+                "t2_max": k["tiers"]["2"].get("exec_ns_max"),
             },
             "sxla_compile_us": {
                 "t0": k["tiers"]["0"]["compile_us"],
@@ -352,6 +461,26 @@ def main() -> int:
             f"{r['numpy_ns']:>10.0f} "
             f"{(r['jax_eager_ns'] or float('nan')):>10.0f} "
             f"{(jit or float('nan')):>10.0f} {ratio:>8.1f}"
+        )
+
+    # CEP-28: per-iteration spread (min..max) beside the mean.
+    print(
+        f"\n{'kernel':<16} {'sxla t2 min..max':>22} {'numpy min..max':>22} "
+        f"{'xla jit min..max':>22}"
+    )
+    for r in out_kernels:
+        t2m, t2x = r["sxla_ns"].get("t2_min"), r["sxla_ns"].get("t2_max")
+        npm, npx = r.get("numpy_ns_min"), r.get("numpy_ns_max")
+        jm, jx = r.get("jax_jit_ns_min"), r.get("jax_jit_ns_max")
+
+        def rng(lo, hi):
+            if lo is None or hi is None:
+                return "-"
+            return f"{lo:.0f}..{hi:.0f}"
+
+        print(
+            f"{r['name']:<16} {rng(t2m, t2x):>22} {rng(npm, npx):>22} "
+            f"{rng(jm, jx):>22}"
         )
 
     if failures:
