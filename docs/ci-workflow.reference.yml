@@ -45,6 +45,12 @@ jobs:
       - name: Benchmark evidence (advisory archive)
         run: |
           cargo run --release --bin anvil_bench | tee .cep/evidence/bench-${{ github.sha }}.txt
+      - name: Kernel bench evidence (advisory archive, smoke scale)
+        # Rust-side smoke only (--scale 0.1): CI runners have no jax; the
+        # cross-system NumPy/XLA comparison is a reference-target activity
+        # (see docs/benchmarks.md — reproduction section).
+        run: |
+          cargo run --release --bin kernel_bench -- --scale 0.1 | tee .cep/evidence/kernel-bench-${{ github.sha }}.txt
       - uses: actions/upload-artifact@v4
         with:
           name: bench-evidence

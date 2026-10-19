@@ -66,6 +66,7 @@ crates/jit          Tiered dispatcher, SPSC boundary, EBR kernel cache
 tools/xla-opt       CLI: IR manipulation and debugging
 tools/xla-run       Standalone JIT executor
 benches/anvil_bench Measurement harness (CEP&CC Law 4 evidence)
+benches/kernel_bench Cross-system kernel bench: Rust harness + ref_xla.py (NumPy/JAX-XLA reference; docs/benchmarks.md)
 tests/              Integration + differential tests
 .cep/               Lint config, waivers, evidence
 ```

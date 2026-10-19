@@ -54,6 +54,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel_bench"
+version = "0.1.0"
+dependencies = [
+ "jit",
+ "runtime",
+ "xir-core",
+]
+
+[[package]]
 name = "runtime"
 version = "0.1.0"
 dependencies = [

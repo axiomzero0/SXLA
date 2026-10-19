@@ -26,6 +26,7 @@ members = [
     "tools/xla-opt",
     "tools/xla-run",
     "benches/anvil_bench",
+    "benches/kernel_bench",
     "tests",
 ]
 

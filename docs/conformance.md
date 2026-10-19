@@ -47,6 +47,7 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | SPSC JIT boundary | complete | boundary tests (incl. cross-thread) |
 | Tier manifests 0/1/2 | complete | driver tests + differential tier test |
 | Benchmarks (Law 4 evidence) | complete | benches/anvil_bench |
+| Cross-system kernel benchmarks (SXLA vs NumPy/XLA) | complete | benches/kernel_bench + ref_xla.py, docs/benchmarks.md, .cep/evidence/kernel-bench-*.txt; bit-exact ew/reduce agreement, dot 1e-16, matmul 1e-12 vs XLA |
 
 ## Partial / stub / placeholder items (with tickets)
 
@@ -66,6 +67,7 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Strided/block layouts | placeholder | CEP-7 |
 | Conv interpreter kernel | complete (naive NCHW/FCHW reference; valid/same/stride) | closed |
 | CI sanitizer matrix | partial (workflow present; nightly TSan gated) | CEP-27 |
+| Conv kernel cross-system bench; timing min/max stats | stub (suite covers elementwise/reduction/dot/matmul) | CEP-28 |
 
 ## Second audit round (session 2) and remediation
 

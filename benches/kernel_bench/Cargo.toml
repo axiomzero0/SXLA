@@ -1,0 +1,34 @@
+# CEP:FILE: benches/kernel_bench/Cargo.toml
+# CEP:WHAT: Manifest for the cross-system kernel benchmark harness binary.
+# CEP:WHY: CEP&CC Law 4 (no unmeasured hot code) + 32.10 (benchmarks mirror
+#          hot code): the Tier-0 interpreter kernels carried O(...) COST
+#          claims with no end-to-end measurement; this harness times them
+#          per tier and hands deterministic dumps to the Python reference
+#          side (ref_xla.py) for NumPy/JAX(XLA) comparison.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: build-time errors only.
+# CEP:ASSUMES: workspace lints apply; zero Rust-side dependencies.
+# CEP:COST: build config only.
+# CEP:EVIDENCE: docs/benchmarks.md + .cep/evidence/kernel-bench-*.txt.
+# CEP:SECURITY: no external code.
+
+[package]
+name = "kernel_bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SXLA cross-system kernel benchmark harness"
+
+[[bin]]
+name = "kernel_bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+jit = { path = "../../crates/jit" }
+runtime = { path = "../../crates/runtime" }
+xir-core = { path = "../../crates/xir-core" }
