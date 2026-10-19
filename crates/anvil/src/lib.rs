@@ -37,6 +37,7 @@ pub mod pool;
 pub mod sharded;
 pub mod spsc;
 pub mod telemetry;
+pub mod typed;
 
 /// Re-exported gear entry points and shared types.
 pub use executor::{

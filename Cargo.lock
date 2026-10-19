@@ -48,6 +48,7 @@ dependencies = [
  "egraph",
  "fusion",
  "runtime",
+ "supertensor",
  "xir-core",
  "xir-graph",
  "xir-levels",
@@ -63,9 +64,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mss"
+version = "0.1.0"
+dependencies = [
+ "anvil",
+]
+
+[[package]]
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "xir-core",
+ "xir-levels",
+]
+
+[[package]]
+name = "supertensor"
+version = "0.1.0"
+dependencies = [
+ "anvil",
+ "fusion",
  "xir-core",
  "xir-levels",
 ]

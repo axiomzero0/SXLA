@@ -1,0 +1,31 @@
+# CEP:FILE: crates/supertensor/Cargo.toml
+# CEP:WHAT: Manifest for the supertensor crate — the deterministic, constrained,
+#           tensor-native superoptimizer (IPO/WPA → schedule polytope → concurrent
+#           enumeration → verification gate).
+# CEP:WHY: The dual-engine architecture separates SuperTensor-WPA (deterministic
+#          tensor scheduling over a constrained polytope) from the stochastic MSS
+#          engine (separate crate). This crate owns XIR Level-2 tensor schedule
+#          search ONLY — scalar/control code is opaque to it by axiom.
+# CEP:CLASS: CEP-29
+# CEP:STATUS: partial
+# CEP:FAILURE: cargo reports resolution errors; no build.
+# CEP:ASSUMES: workspace lints apply (warnings-as-errors); zero external deps.
+# CEP:COST: build-time only.
+# CEP:EVIDENCE: crate test suite; jit driver differential test.
+# CEP:SECURITY: consumes repository-trusted XIR only.
+
+[package]
+name = "supertensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anvil = { path = "../anvil" }
+xir-core = { path = "../xir-core" }
+xir-levels = { path = "../xir-levels" }
+fusion = { path = "../fusion" }
+
+[lints]
+workspace = true

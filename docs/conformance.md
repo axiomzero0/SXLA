@@ -68,6 +68,9 @@ Honest status per CEP&CC 10.5. `complete` = implemented, tested, documented.
 | Conv interpreter kernel | complete (naive NCHW/FCHW reference; valid/same/stride) | closed |
 | CI sanitizer matrix | partial (workflow present; nightly TSan gated) | CEP-27 |
 | Conv kernel cross-system bench; timing min/max stats | done (session 4: 3 conv kernels cross-checked vs NumPy/XLA with semantics-matched explicit padding; per-iteration min/max in both harness and reference) | closed CEP-28 |
+| Typed zero-copy SPSC channels (Anvil v2 Upgrade 3) | complete (Pod marker + const layout checks, cache-line-aligned slots, batched-fence publication with explicit flush protocol, SPIN/YIELD/PARK const-generic backpressure, threshold<=capacity/2 progress invariant) | typed.rs tests (9) incl. 1M-element stress and all-backpressure round-trips; CEP-30 |
+| SuperTensor-WPA superoptimizer (CEP-29) | complete pipeline (Gear-0 WPA polytope extraction, typed-SPSC enumerative search with Pareto frontier + 3-axis prune anchor, constructive verification gate, ClusterSet bridge; jit Tier-2 integration with fallback); SMT escalation + Level-3 tile consumption ticketed | 51 tests incl. pruned-vs-exhaustive equivalence witness, budget/determinism flags; CEP-29 |
+| Massive Stochastic Superoptimizer V0 (CEP-31) | partial V0 (ECS SoN arena, CoW overlay candidates, 8 mutation families with Tier-1 overflow preconditions, FNV TT, 4-band parallel-tempering MCMC via Gear-0, differential interpreter); V1-V4 layers ticketed | 22 tests incl. differential value preservation + reproducibility across worker counts; CEP-31 |
 
 ## Second audit round (session 2) and remediation
 
@@ -281,3 +284,53 @@ A full standards audit (task 16) against CEP&CC 0.1 found 19 issues (3×S0,
   actually shrink foldable programs while preserving executed values.
   Wiring this exposed and fixed a slot-index sizing bug (live count vs slot
   space) across seven crates.
+
+## Dual-engine superoptimizers (session 5)
+
+Three increments landed together as the dual-engine architecture's first
+physical layer. **Anvil v2 Upgrade 3 (CEP-30)** added the typed zero-copy
+SPSC channel (`anvil::typed`): Pod marker with const-evaluated layout
+verification, cache-line-aligned slot arrays, batched-fence publication with
+the explicit flush protocol (threshold/flush/Drop), and const-generic
+backpressure (SPIN/YIELD/PARK). Two concurrency bugs were caught by tests
+and fixed before commit: the capacity check must use the producer's LOCAL
+next-write index (published-atomic reads alias slots inside one batch
+window), and the effective batch threshold must not exceed capacity/2 (a
+threshold above capacity deadlocks producer and consumer — the
+`backpressure_modes_roundtrip` regression).
+
+**SuperTensor-WPA (CEP-29, crates/supertensor)** implements the
+deterministic tensor-schedule superoptimizer: WPA extracts the schedule
+polytope on Gear-0 (liveness footprint rules, tile domains over gcd(shape,
+max_tile), fusion-legality-pre-filtered targets, vector widths from the
+innermost dim), workers enumerate the feasible region through per-worker
+typed channels into a single-threaded Pareto merger that publishes a
+3-axis packed prune anchor, and the Top-K gate constructively verifies the
+winner (every polytope constraint + fusion legality re-check; SMT
+subprocess escalation is a documented CEP-29 TODO pending a timeout-capable
+zero-dependency subprocess facility). The jit driver consumes it at Tier 2
+for tensor-heavy programs with fallback to the existing fusion search;
+values are placement-preserved by construction and enforced by the existing
+differential tier tests.
+
+**MSS V0 (CEP-31, crates/mss)** is the stochastic scalar engine on its own
+ECS Sea-of-Nodes dialect: CoW overlay candidates, eight mutation families
+(with checked-arithmetic Tier-1 preconditions — an overflowing const fold
+is skipped, never wrapped), alias-transparent canonical hashing, a
+deterministic FNV transposition table, and four parallel-tempering MCMC
+bands partitioned on Gear-0. The engines are hard-separated per the
+architecture (no shared state; boundaries A/B/C are ticketed follow-ups).
+
+**Mandatory review round:** a dedicated review agent audited the increment
+and found four S1 defects, all fixed pre-commit with regression evidence:
+(F1) the prune anchor packed only two of the dominance's three axes, making
+frontier content interleaving-dependent; (F2) `op_min_hbm` was not a sound
+lower bound (SRAM placements contribute zero HBM traffic); (F3) the
+divisibility check was inverted, collapsing the tile domain to a singleton;
+(F4) the MSS elite comparison could prefer a worse-total candidate. The
+determinism claim is now explicitly conditioned (budgets/frontier-cap flags
+surfaced in `SearchOutcome`) and carries an executable witness:
+`pruned_matches_exhaustive` runs the search with and without pruning and
+asserts identical frontier content. Gates at commit: 279 tests (0 failed),
+clippy -D warnings clean, fmt clean, cep_lint 91 files 0 violations;
+test-scoped clippy::expect_used allowances are waiver W-5.

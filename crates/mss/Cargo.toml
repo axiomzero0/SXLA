@@ -1,0 +1,30 @@
+# CEP:FILE: crates/mss/Cargo.toml
+# CEP:WHAT: Manifest for the mss crate — the Massive Stochastic Superoptimizer
+#           V0 (ECS SoN arena, CoW edit candidates, mutation operators, tiered
+#           filters, canonical hashing, transposition table, parallel-tempering
+#           MCMC search, elite archive, differential interpreter).
+# CEP:WHY: Dual-engine architecture: MSS owns the scalar/control SoN domain;
+#          SuperTensor-WPA owns tensor scheduling. Separate crates, separate
+#          test suites, no shared internal state (integration at XIR
+#           boundaries only — V0 keeps the engine self-contained on its own
+#          SoN dialect; Boundary A/B are CEP-31 follow-ups).
+# CEP:CLASS: CEP-31
+# CEP:STATUS: partial (V0)
+# CEP:FAILURE: cargo reports resolution errors; no build.
+# CEP:ASSUMES: workspace lints apply; zero external deps.
+# CEP:COST: build-time only.
+# CEP:EVIDENCE: crate test suite (differential + determinism + throughput).
+# CEP:SECURITY: no untrusted input (internal dialect).
+
+[package]
+name = "mss"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anvil = { path = "../anvil" }
+
+[lints]
+workspace = true

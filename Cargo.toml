@@ -23,6 +23,8 @@ members = [
     "crates/codegen",
     "crates/runtime",
     "crates/jit",
+    "crates/supertensor",
+    "crates/mss",
     "tools/xla-opt",
     "tools/xla-run",
     "benches/anvil_bench",

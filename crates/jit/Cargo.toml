@@ -28,3 +28,4 @@ xir-levels = { path = "../xir-levels" }
 egraph = { path = "../egraph" }
 fusion = { path = "../fusion" }
 runtime = { path = "../runtime" }
+supertensor = { path = "../supertensor" }

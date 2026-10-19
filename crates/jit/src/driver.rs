@@ -203,10 +203,26 @@ pub fn compile(
     // values are enforced equal by the differential tier test.
     let mut fused_clusters: Option<xir_levels::level2::ClusterSet> = None;
     if tier == Tier::Tier2 {
-        let arena = current.arena();
-        let outcome = fusion::search::search(arena, anvil::default_worker_count().max(1))
-            .map_err(|_| JitError::Pipeline("fusion-search"))?;
-        fused_clusters = Some(outcome.clusters);
+        // CEP-29 (SuperTensor-WPA accelerator): tensor-heavy programs run
+        // the deterministic polytope superoptimizer FIRST — WPA bounds, typed
+        // -SPSC enumeration, Pareto frontier, constructive verification gate
+        // — and its ClusterSet replaces the fusion-universe search. ANY
+        // failure (no tensor ops, no verified candidate, gate violation)
+        // falls through to the existing search: the accelerator can speed
+        // the tier up but never change its results (schedules are placement
+        // -only; values are enforced by the differential tier tests below
+        // and the CEP-29 test suite).
+        if supertensor::is_tensor_heavy(current.arena(), 2) {
+            if let Ok(outcome) = supertensor::superoptimize_arena(current.arena()) {
+                fused_clusters = Some(outcome.clusters);
+            }
+        }
+        if fused_clusters.is_none() {
+            let arena = current.arena();
+            let outcome = fusion::search::search(arena, anvil::default_worker_count().max(1))
+                .map_err(|_| JitError::Pipeline("fusion-search"))?;
+            fused_clusters = Some(outcome.clusters);
+        }
     }
     // Structurize + lower — FROM THE OPTIMIZED SNAPSHOT (audit F-3); at
     // Tier 2 the projection honors the fusion decisions (CEP-22).
