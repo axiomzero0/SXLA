@@ -221,6 +221,22 @@ element-agreement op coverage is a conservative superset of the ops
 that can reach integer-gated rewrites, first-error determinism (38.19)
 is preserved, and no false positives exist across the suite.
 
+## CI activation (session 4)
+
+The kernel-bench increment (session 4, benchmarked against NumPy/XLA
+per docs/benchmarks.md) was pushed to origin/main with a fresh
+credential, and that credential succeeded where the session-3 one was
+rejected: `.github/workflows/ci.yml` is committed and pushed, so the
+build + test + clippy + fmt + cep-lint job, the advisory bench-evidence
+archives, and the sanitizer matrix now execute on GitHub's runners.
+Waiver W-4 is closed accordingly. The reference copy
+(docs/ci-workflow.reference.yml) remains the specification of record:
+the live file is byte-identical to it minus the trailing NOTE block,
+and the NOTE states the keep-in-sync rule (edit the reference first,
+then mirror). The `--scale 0.1` kernel-bench step is Rust-side only —
+CI runners have no jax; the cross-system NumPy/XLA comparison stays a
+reference-target activity (docs/benchmarks.md, reproduction section).
+
 ## Waivers
 
 See [.cep/waivers.md](../.cep/waivers.md) — all temporary, owner-assigned,
