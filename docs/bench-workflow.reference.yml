@@ -1,0 +1,60 @@
+# CEP:FILE: .github/workflows/bench.yml
+# CEP:WHAT: Always-on benchmark evidence — anvil microbenches and the
+#          kernel bench smoke run on EVERY push to main, every PR, daily
+#          via schedule, and on manual dispatch.
+# CEP:WHY: CEP&CC Law 4 (no unmeasured hot code) and 13.2 (measurement
+#          artifacts): performance evidence must accrue continuously, not
+#          only when someone remembers to run it. The daily schedule
+#          catches environment drift (runner hardware, toolchain) between
+#          code changes; the PR trigger catches regressions before merge.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete (session 6: split out of ci.yml's build-test job and
+#          made always-on per the standing directive "benchmark it all the
+#          time").
+# CEP:FAILURE: a failing bench run fails the workflow (the benches are also
+#          correctness harnesses: cross-tier bit agreement is asserted);
+#          PERFORMANCE regressions are advisory (numbers are archived for
+#          trend comparison, not gated — gating on shared-runner timings
+#          would be noise, not evidence).
+# CEP:ASSUMES: pinned toolchain from rust-toolchain.toml; CI runners have
+#          no jax (kernel_bench runs the Rust smoke scale 0.1; the
+#          cross-system NumPy/XLA comparison stays a reference-target
+#          activity — see docs/benchmarks.md reproduction section).
+# CEP:COST: CI minutes; one release build per trigger.
+# CEP:EVIDENCE: uploaded artifacts bench-evidence-<run_id> (90-day
+#          retention); docs/benchmarks.md documents the protocol.
+# CEP:SECURITY: pinned actions by major tag; no secrets needed.
+
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: anvil_bench + kernel_bench (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: anvil microbenchmarks
+        run: cargo run --release --bin anvil_bench | tee .cep/evidence/bench-${{ github.sha }}.txt
+      - name: Kernel bench evidence (smoke scale 0.1)
+        run: cargo run --release --bin kernel_bench -- --scale 0.1 | tee .cep/evidence/kernel-bench-${{ github.sha }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-evidence-${{ github.run_id }}
+          path: .cep/evidence/
+          retention-days: 90
+# NOTE: this reference copy is mirrored live at .github/workflows/bench.yml
+# (live since 2026-10-27). The live copy is byte-identical to this file minus
+# this NOTE block. Keep the two in sync: edit here first, then copy the file
+# to the live path minus this NOTE (Law 8).

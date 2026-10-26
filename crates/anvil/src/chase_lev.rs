@@ -18,10 +18,11 @@
 // CEP:COST: push ~1 Release store + masked write; pop ~1 SeqCst fence + loads;
 //           steal ~1 SeqCst fence + CAS. Measured in benches/anvil_bench.rs.
 // CEP:EVIDENCE: tests `lifo_order_single_thread`, `steal_takes_fifo`,
-//           `stress_owner_vs_stealer` (16 threads, 100k tasks, Miri-ineligible
-//           and an ADVISORY TSan CI job — soft gate per CEP-27, audit
-//           F-11: advisory runs cannot certify "clean"; hardening is
-//           ticketed), bench `bench_chase_lev_push_pop`.
+//           `stress_owner_vs_stealer` (16 threads, 100k tasks); the CI TSan
+//           hard gate (session 6): the pre-session speculative-read protocol
+//           produced a reproducible data race (steal slot read vs push slot
+//           write after index wraparound) that this per-slot-state protocol
+//           eliminates; bench `bench_chase_lev_push_pop`.
 // CEP:SECURITY: raw pointer writes bounded by mask-computed slot indices
 //           derived from internally-maintained atomics; no external input.
 // CEP:HPC-DETERMINISM: deterministic per-deque LIFO/FIFO contract; global
@@ -31,7 +32,18 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{fence, AtomicIsize, Ordering};
+use core::sync::atomic::{fence, AtomicIsize, AtomicU8, Ordering};
+
+/// Per-physical-slot data state. FREE: no live element (a push may write the
+/// slot). FULL: a live element is present and initialized; the consumer that
+/// owns the slot's index (steal CAS winner / owner pop) reads it and returns
+/// the slot to FREE. This is the Go-runq discipline: every non-atomic slot
+/// access is sandwiched between Acquire/Release state transitions, so no two
+/// threads ever touch the same slot's data concurrently — including across
+/// index wraparound (an aliased push at index t + capacity blocks on FREE
+/// until the in-flight reader of index t publishes FREE).
+const SLOT_FREE: u8 = 0;
+const SLOT_FULL: u8 = 1;
 
 /// Failure enumeration for deque operations.
 ///
@@ -74,6 +86,9 @@ pub struct Deque<T> {
     /// Slot array, capacity = power of two. Written by owner (push),
     /// read by owner (pop) and stealers (steal) under the CAS protocol.
     buffer: UnsafeCell<Box<[MaybeUninit<T>]>>,
+    /// Per-physical-slot data states (SLOT_FREE/SLOT_FULL), parallel to
+    /// `buffer`. Pure atomics — no UnsafeCell needed. See SLOT_FREE doc.
+    states: Box<[AtomicU8]>,
     /// Mask = capacity - 1.
     mask: usize,
 }
@@ -94,10 +109,14 @@ impl<T> Deque<T> {
         let buffer: Box<[MaybeUninit<T>]> = core::iter::repeat_with(MaybeUninit::uninit)
             .take(capacity)
             .collect();
+        let states: Box<[AtomicU8]> = core::iter::repeat_with(|| AtomicU8::new(SLOT_FREE))
+            .take(capacity)
+            .collect();
         Box::new(Deque {
             bottom: CachePadded::new(AtomicIsize::new(0)),
             top: CachePadded::new(AtomicIsize::new(0)),
             buffer: UnsafeCell::new(buffer),
+            states,
             mask: capacity - 1,
         })
     }
@@ -122,19 +141,30 @@ impl<T> Deque<T> {
         if b - t >= (self.mask as isize) {
             return Err(DequeError::Full);
         }
+        // Physical-slot gate: the slot must be FREE. It is FULL only when a
+        // consumer of a PREVIOUS generation (index - capacity) is still
+        // between its index CAS and its FREE publication — a few instructions,
+        // reachable only after a full wraparound plus preemption inside that
+        // window. Reporting `Full` then is honest backpressure (retryable),
+        // never a lost element, and it is what makes the aliased write
+        // impossible rather than merely unlikely.
+        let slot = usize::try_from(b).map_err(|_| DequeError::Full)? & self.mask;
+        if self.states[slot].load(Ordering::Acquire) != SLOT_FREE {
+            return Err(DequeError::Full);
+        }
         // CEP:UNSAFE | Safety: masked write into the slot array; slot index derived from
         //             `b` which the owner exclusively controls at this point and
-        //             which the Full check above proved in-range. The slot may
-        //             still hold a forgotten value from a lost race — write
-        //             overwrites raw storage without running a destructor,
-        //             which is exactly the ownership protocol (loser forgot it).
-        // CEP:ASSUMES: b in [t, t + capacity); proven by the check above.
+        //             which the Full check above proved in-range. The slot state
+        //             was observed FREE with Acquire: every previous consumer's
+        //             read happened-before this write (their FREE store pairs
+        //             with this load), so no concurrent reader exists.
+        // CEP:ASSUMES: b in [t, t + capacity); slot state == FREE (both proven above).
         // CEP:SECURITY: no untrusted input reaches indices.
         unsafe {
-            (*self.buffer.get())[usize::try_from(b).map_err(|_| DequeError::Full)? & self.mask]
-                .write(value);
+            (*self.buffer.get())[slot].write(value);
         }
-        // Publish the element to stealers.
+        // Publish the element's data first (Full state), then the index.
+        self.states[slot].store(SLOT_FULL, Ordering::Release);
         self.bottom.store(b + 1, Ordering::Release);
         Ok(())
     }
@@ -160,35 +190,49 @@ impl<T> Deque<T> {
         if t <= b {
             // Deque non-empty from this owner's viewpoint.
             let slot_idx = usize::try_from(b).map_err(|_| DequeError::Empty)?;
-            // CEP:ASSUMES: b in [t, t + capacity); invariant of the protocol.
-            // CEP:SECURITY: indices from internal atomics only.
-            // CEP:UNSAFE | Safety: read of slot b — if t < b the slot is
-            //             exclusively owned by the owner (stealers can only
-            //             reach indices < the stored bottom, which is now b);
-            //             if t == b the CAS below arbitrates ownership with
-            //             concurrent stealers and the loser forgets its copy.
-            let value = unsafe { (*self.buffer.get())[slot_idx & self.mask].assume_init_read() };
+            let slot = slot_idx & self.mask;
             if t == b {
-                // Last element: race against stealers via top CAS.
+                // Last element: arbitrate with concurrent stealers FIRST via
+                // the top CAS; only the winner touches the slot data. (The
+                // pre-session protocol read speculatively and forgot on loss
+                // — that read was the wraparound data race.)
                 match self
                     .top
                     .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Acquire)
                 {
                     Ok(_) => {
-                        // Owner won; deque is now empty.
+                        // Owner won; deque is now empty. The slot data was
+                        // written by this owner's own push (same-thread
+                        // sequencing), and no stealer can own index b (the
+                        // failed CAS means none advanced top past b).
+                        // CEP:UNSAFE | Safety: exclusive data read proven by the
+                        //             arbitration above; same-thread write
+                        //             sequencing; aliased future writes gate on
+                        //             the FREE store below.
+                        // CEP:ASSUMES: top == b + 1 after the winning CAS.
+                        let value = unsafe { (*self.buffer.get())[slot].assume_init_read() };
+                        self.states[slot].store(SLOT_FREE, Ordering::Release);
                         self.bottom.store(b + 1, Ordering::Relaxed);
                         Ok(value)
                     }
                     Err(_) => {
-                        // A stealer won ownership of this element. Forget our
-                        // read: the stealer owns the value; dropping here would
-                        // be a double-drop.
-                        core::mem::forget(value);
+                        // A stealer won ownership of this element; we never
+                        // touched the slot data. Restore bottom; the stealer
+                        // publishes FREE after its own read.
                         self.bottom.store(b + 1, Ordering::Relaxed);
                         Err(DequeError::Empty)
                     }
                 }
             } else {
+                // t < b: the slot is exclusively owned by the owner (stealers
+                // can only reach indices < the stored bottom, which is now
+                // b), and the data was written by this owner's own push.
+                // CEP:UNSAFE | Safety: owner-exclusive data read (index CAS
+                //             domain above); aliased future pushes gate on the
+                //             FREE store below.
+                // CEP:ASSUMES: b in (t, t + capacity); invariant of the protocol.
+                let value = unsafe { (*self.buffer.get())[slot].assume_init_read() };
+                self.states[slot].store(SLOT_FREE, Ordering::Release);
                 Ok(value)
             }
         } else {
@@ -209,7 +253,7 @@ impl<T> Deque<T> {
     /// CEP:ASSUMES: caller is not the owner thread (ownership is the executor's
     ///              to enforce; stealing your own deque still works but is
     ///              pointless).
-    /// CEP:COST: 1 fence(SeqCst) + 2 loads + 1 CAS.
+    /// CEP:COST: 1 fence(SeqCst) + 2 loads + 1 CAS + 2 slot-state atomics.
     /// CEP:EVIDENCE: tests `steal_takes_fifo`, `stress_owner_vs_stealer`
     /// CEP:SECURITY: indices from internal atomics only.
     #[inline]
@@ -218,27 +262,54 @@ impl<T> Deque<T> {
         fence(Ordering::SeqCst);
         let b = self.bottom.load(Ordering::Acquire);
 
-        if t < b {
-            let slot_idx = usize::try_from(t).map_err(|_| DequeError::Empty)?;
-            // CEP:ASSUMES: t in [0, isize range); enforced by protocol bounds.
-            // CEP:SECURITY: no untrusted input.
-            // CEP:UNSAFE | Safety: speculative read of slot t. Ownership is
-            //             decided by the CAS on top below: if it succeeds, we
-            //             own `value`; if it fails, another stealer owns it and
-            //             we forget our copy (no drop of unowned data).
-            let value = unsafe { (*self.buffer.get())[slot_idx & self.mask].assume_init_read() };
-            match self
-                .top
-                .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
-            {
-                Ok(_) => Ok(value),
-                Err(_) => {
-                    core::mem::forget(value);
-                    Err(DequeError::Busy)
+        if t >= b {
+            return Err(DequeError::Empty);
+        }
+        // Resolve the slot index BEFORE reserving it: a failed conversion
+        // must not abandon an already-won index (that would strand the slot
+        // in FULL forever). Negative indices are unreachable (top starts at
+        // zero and only ever advances via CAS), so this is purely defensive.
+        let slot = match usize::try_from(t) {
+            Ok(s) => s & self.mask,
+            Err(_) => return Err(DequeError::Empty),
+        };
+        // Reserve index t FIRST (the CAS is the linearization point); the
+        // slot data is touched only after ownership is won. The pre-session
+        // protocol read the slot speculatively before the CAS — a data race
+        // against owner pushes into the aliased slot after wraparound
+        // (TSan-reproduced, session 6).
+        match self
+            .top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // We own index t. Acquire-load the slot state: it pairs with
+                // the owner push's FULL Release store, establishing
+                // happens-before from the data write to the read below. (The
+                // b > t observation above already implies FULL is visible:
+                // the FULL store is sequenced before the bottom Release
+                // store that our Acquire load observed.)
+                if self.states[slot].load(Ordering::Acquire) != SLOT_FULL {
+                    // Unreachable per the happens-before argument; defensive
+                    // retry keeps the no-panic contract if memory is corrupt.
+                    return Err(DequeError::Busy);
                 }
+                // CEP:UNSAFE | Safety: exclusive data read. Ownership of index
+                //             t is proven by the winning CAS; initialization
+                //             is proven by the FULL state observation (its
+                //             Release store is sequenced after the owner's
+                //             data write); aliasing is impossible because any
+                //             future push at t + capacity must first observe
+                //             this slot FREE — which this thread publishes
+                //             only AFTER the read completes.
+                // CEP:ASSUMES: state == FULL (checked above).
+                // CEP:SECURITY: no untrusted input.
+                let value = unsafe { (*self.buffer.get())[slot].assume_init_read() };
+                // Release the physical slot for the next generation.
+                self.states[slot].store(SLOT_FREE, Ordering::Release);
+                Ok(value)
             }
-        } else {
-            Err(DequeError::Empty)
+            Err(_) => Err(DequeError::Busy),
         }
     }
 
@@ -315,7 +386,10 @@ use crate::pad::CachePadded;
 
 // CEP:UNSAFE | Safety: Deque is Sync when T: Send: all cross-thread access goes through
 //             atomics with the protocol above; the UnsafeCell buffer is only
-//             touched under the CAS/fence discipline proven in Le et al. 2013.
+//             touched between the per-slot state transitions (FREE-observed
+//             write for push, FULL-observed read + FREE publication for
+//             pop/steal — the Go-runq discipline; see SLOT_FREE doc), so no
+//             two threads access the same slot's data concurrently.
 // CEP:ASSUMES: exactly one owner calls push/pop (Worker discipline).
 // CEP:SECURITY: no external input.
 unsafe impl<T: Send> Sync for Deque<T> {}

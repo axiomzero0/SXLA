@@ -1,0 +1,9 @@
+sxla anvil bench — target: rustc stable x86_64 linux
+bump_alloc_u32                10.00 ns/op   (10000000 iters)
+chase_lev_push_pop           159.58 ns/op   (5000000 iters)
+spsc_push_pop                 64.21 ns/op   (5000000 iters)
+ebr_pin_unpin                125.22 ns/op   (5000000 iters)
+fnv64_u64                      0.28 ns/op   (10000000 iters)
+region_scoped              62503.43 ns/op   (2000 iters)
+region_pooled               2049.76 ns/op   (2000 iters)
+done.

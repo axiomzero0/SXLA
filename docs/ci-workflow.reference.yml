@@ -1,16 +1,23 @@
 # CEP:FILE: .github/workflows/ci.yml
 # CEP:WHAT: SXLA continuous integration — build, test, clippy, fmt, CEP lint,
-#          bench evidence, and the sanitizer matrix.
+#          and the sanitizer matrix as HARD gates. Benchmark evidence lives
+#          in .github/workflows/bench.yml (always-on: push, PR, daily).
 # CEP:WHY: CEP&CC 2.3 (mechanical enforcement), 6.3 (warnings-as-errors),
 #          6.6 (sanitizers in CI), 16 (CI can block non-compliant merges).
 # CEP:CLASS: CEP-2
-# CEP:STATUS: partial
-# CEP:FAILURE: any gate failing fails the workflow; sanitizers run on
-#          nightly with continue-on-error until CEP-27 wires them as hard
-#          gates.
-# CEP:ASSUMES: pinned toolchain from rust-toolchain.toml.
+# CEP:STATUS: complete (session 6: sanitizer legs promoted from
+#          continue-on-error to hard gates — both races that the soft gate
+#          had been tolerating were reproduced locally, fixed, and the
+#          matrix verified clean under TSan halt_on_error=1 and ASan).
+# CEP:FAILURE: any gate failing fails the workflow.
+# CEP:ASSUMES: pinned toolchain from rust-toolchain.toml for build-test; the
+#          sanitizer matrix pins nightly-2026-10-25 (the nightly verified
+#          locally with -Zbuild-std TSan; advance the pin deliberately with
+#          a local verification run — floating nightlies silently broke the
+#          TSan leg before this pin).
 # CEP:COST: CI minutes; offline cacheable build (zero deps).
-# CEP:EVIDENCE: workflow runs themselves are the artifact register.
+# CEP:EVIDENCE: workflow runs themselves are the artifact register; the
+#          session-6 run is the first with the sanitizer legs hard.
 # CEP:SECURITY: pinned actions by major tag; no secrets needed.
 
 name: ci
@@ -42,38 +49,43 @@ jobs:
         run: cargo fmt --all -- --check
       - name: CEP comment-field lint (CEP&CC 10.2/10.10)
         run: python3 scripts/cep_lint.py crates tools benches tests
-      - name: Benchmark evidence (advisory archive)
-        run: |
-          cargo run --release --bin anvil_bench | tee .cep/evidence/bench-${{ github.sha }}.txt
-      - name: Kernel bench evidence (advisory archive, smoke scale)
-        # Rust-side smoke only (--scale 0.1): CI runners have no jax; the
-        # cross-system NumPy/XLA comparison is a reference-target activity
-        # (see docs/benchmarks.md — reproduction section).
-        run: |
-          cargo run --release --bin kernel_bench -- --scale 0.1 | tee .cep/evidence/kernel-bench-${{ github.sha }}.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bench-evidence
-          path: .cep/evidence/
 
   sanitizers:
-    name: sanitizers (ASan/UBSan; TSan nightly)
+    name: sanitizers (${{ matrix.sanitizer }} — hard gate)
     runs-on: ubuntu-latest
-    continue-on-error: true  # CEP-27: promote to hard gates after burn-in
     strategy:
+      fail-fast: false
       matrix:
-        sanitizer: [address, thread]
+        include:
+          - sanitizer: address
+            build-std: ""
+          - sanitizer: thread
+            build-std: "-Zbuild-std"
+    env:
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      # TSan must halt on the first race or a data race would pass silently
+      # (verified locally: the default prints and exits 0). ASan halts by
+      # default and ignores TSAN_OPTIONS.
+      TSAN_OPTIONS: halt_on_error=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - name: Run tests under ${{ matrix.sanitizer }}
-        env:
-          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
-        run: |
-          cargo +nightly test --workspace --tests --target x86_64-unknown-linux-gnu
+        with:
+          toolchain: nightly-2026-10-25
+          components: rust-src
+      - name: Build workspace bins (integration tests spawn them)
+        # The bins must exist as RUNNABLE binaries: `cargo test --tests`
+        # compiles tools only as test targets. The TSan leg builds std from
+        # source (rustc hard-errors on instrumented crates linked against
+        # uninstrumented std otherwise).
+        run: cargo +nightly-2026-10-25 build --workspace --target x86_64-unknown-linux-gnu ${{ matrix.build-std }}
+      - name: Test under ${{ matrix.sanitizer }}
+        run: cargo +nightly-2026-10-25 test --workspace --tests --target x86_64-unknown-linux-gnu ${{ matrix.build-std }}
 # NOTE: this reference copy is mirrored live at .github/workflows/ci.yml
-# (committed and pushed 2026-10-20 with a workflow-capable credential —
-# waiver W-4 closed). The live copy is byte-identical to this file minus
-# this NOTE block. Keep the two in sync: edit here first, then copy
-# lines 1-73 to the live path. CEP:EVIDENCE fields citing this workflow
-# describe the executing CI from that date onward (Law 8).
+# (live since 2026-10-20, waiver W-4 closed). The live copy is byte-identical
+# to this file minus this NOTE block. Keep the two in sync: edit here first,
+# then copy the file to the live path minus this NOTE. CEP:EVIDENCE fields
+# citing this workflow describe the executing CI from that date onward
+# (Law 8). Session 6: sanitizer legs are HARD gates on pinned
+# nightly-2026-10-25 (advance the pin deliberately with a local
+# verification run); bench evidence moved to bench.yml (always-on).

@@ -7,7 +7,11 @@
 // CEP:CLASS: CEP-2 (tests)
 // CEP:STATUS: complete
 // CEP:FAILURE: asserts fire on any semantic divergence.
-// CEP:ASSUMES: workspace binaries built (cargo test builds them).
+// CEP:ASSUMES: workspace tool binaries were built by a prior cargo build
+//           (the CI sanitizer job builds them explicitly before testing);
+//           find_tool locates them under ANY target-dir layout — plain
+//           target/debug, target/<triple>/debug (cargo test --target), and
+//           release variants (cargo test --release).
 // CEP:COST: test-only; full pipelines per case.
 // CEP:EVIDENCE: this file.
 // CEP:SECURITY: trusted fixture strings.
@@ -22,8 +26,59 @@ const ADD_SRC: &str =
 /// Fixture with foldable constants and a dead node.
 const CANON_SRC: &str = "xir v1 func @main {\n  %0 = const.f64 3.0\n  %1 = const.f64 4.0\n  %2 = binary.add %0, %1\n  %3 = unary.neg %2\n  %4 = binary.mul %2, %2\n}\n";
 
+/// Workspace root (this crate is <root>/tests).
+fn ws_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf()
+}
+
+/// Candidate tool paths, in deterministic priority order:
+/// CARGO_BIN_EXE_<tool> (cargo-provided), then the running test binary's
+/// ancestor directories (covers target/debug/deps, target/<triple>/debug,
+/// target/<triple>/debug/build/<pkg>/<hash>/out, and release layouts),
+/// then the manifest-relative target tree including every triple dir.
+/// First existing file wins; the fallback keeps the classic
+/// target/debug path so a missing build fails with a recognizable ENOENT.
+fn tool_candidates(tool: &str) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var(format!("CARGO_BIN_EXE_{tool}")) {
+        out.push(PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors().skip(1).take(10) {
+            out.push(anc.join(tool));
+            out.push(anc.join("debug").join(tool));
+            out.push(anc.join("release").join(tool));
+        }
+    }
+    let target = ws_root().join("target");
+    for prof in ["debug", "release"] {
+        out.push(target.join(prof).join(tool));
+    }
+    if let Ok(rd) = std::fs::read_dir(&target) {
+        let mut tris: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        tris.sort();
+        for t in tris {
+            for prof in ["debug", "release"] {
+                out.push(t.join(prof).join(tool));
+            }
+        }
+    }
+    out
+}
+
 fn run_tool(tool: &str, args: &[&str]) -> (bool, String) {
-    let bin = format!("{}/../target/debug/{}", env!("CARGO_MANIFEST_DIR"), tool);
+    let bin = tool_candidates(tool)
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| ws_root().join("target").join("debug").join(tool));
     let out = Command::new(bin).args(args).output();
     match out {
         Ok(o) => {
@@ -31,7 +86,7 @@ fn run_tool(tool: &str, args: &[&str]) -> (bool, String) {
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             (o.status.success(), format!("{}{}", stdout, stderr))
         }
-        Err(e) => (false, format!("spawn failed: {}", e)),
+        Err(e) => (false, format!("spawn failed: {} (bin={})", e, tool)),
     }
 }
 
@@ -44,7 +99,7 @@ fn write_fixture(name: &str, src: &str) -> String {
 // CEP:WHAT: xla-run executes at all tiers with identical results.
 // CEP:STATUS: complete
 // CEP:FAILURE: assert fires on tier divergence.
-// CEP:ASSUMES: debug binaries present.
+// CEP:ASSUMES: tool binaries built (find_tool resolves the layout).
 // CEP:COST: test-only
 // CEP:EVIDENCE: this test
 #[test]

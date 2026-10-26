@@ -8,6 +8,23 @@ archived in `.cep/evidence/kernel-bench-2026-10-20.txt` (the CEP-28 run: conv
 class + per-iteration min/max statistics; the prior 2026-10-19 run remains
 archived alongside it).
 
+## Always-on benchmarking (session 6)
+
+Benchmark evidence accrues continuously, not on demand:
+`.github/workflows/bench.yml` (mirrored at
+`docs/bench-workflow.reference.yml`) runs `anvil_bench` and the kernel bench
+smoke (`--scale 0.1`) on EVERY push to main, every pull request, daily at
+06:00 UTC, and on manual dispatch, uploading per-run artifacts with 90-day
+retention so timing trends are comparable across runner generations. The
+daily schedule exists to catch environment drift (runner hardware,
+toolchain) independent of code changes. Locally, `scripts/bench.sh [scale]`
+produces the same evidence files under `.cep/evidence/`. Numbers are
+advisory evidence (shared-runner timing is noise-prone; nothing is gated on
+them), while the benches' built-in correctness assertions (cross-tier bit
+agreement, reference value checks) remain hard. Full-scale cross-system
+reference runs against NumPy/XLA stay manual, per the reproduction section
+below — CI runners have no jax.
+
 ## Harness
 
 | Piece | Where | Role |

@@ -30,6 +30,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem;
+use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 use crate::config::SHARD_COUNT;
@@ -107,8 +108,14 @@ struct Slot<V> {
     state: AtomicU8,
     /// Key; written once under Reserved, immutable once Full.
     key: UnsafeCell<u64>,
-    /// Value; written once under Reserved, immutable once Full.
-    value: UnsafeCell<Option<Box<V>>>,
+    /// Value pointer; null == absent. The pointed-to V is owned by the
+    /// slot (or, after a resize move, by the new table's slot). Swapped
+    /// atomically (AcqRel) so lock-free readers never race a writer's
+    /// replace/take: the pre-session UnsafeCell<Option<Box<V>>> let a
+    /// reader's `as_ref` race the writer's `replace`/`take` under the
+    /// writer lock — EBR defers freeing, it does not order access
+    /// (TSan-reproduced, session 6).
+    value: AtomicPtr<V>,
 }
 
 /// A table generation belonging to one shard.
@@ -139,7 +146,7 @@ impl<V> Table<V> {
             slots.push(Slot {
                 state: AtomicU8::new(SlotState::Empty as u8),
                 key: UnsafeCell::new(0),
-                value: UnsafeCell::new(None),
+                value: AtomicPtr::new(null_mut()),
             });
         }
         Ok(Table {
@@ -147,6 +154,34 @@ impl<V> Table<V> {
             mask: capacity - 1,
             used: AtomicUsize::new(0),
         })
+    }
+}
+
+impl<V> Drop for Table<V> {
+    /// CEP:WHAT: Frees every live slot value (shutdown / EBR-drain path).
+    /// CEP:WHY: AtomicPtr has no destructor; the slot's pointed-to Box must
+    ///          be reclaimed explicitly or every value leaks. Runs either at
+    ///          map teardown (quiescent) or when the EBR collector drops a
+    ///          retired table — by then every moved slot reads null, so no
+    ///          value is freed twice.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: none
+    /// CEP:ASSUMES: no reader is inside a probe of THIS table (teardown
+    ///              contract / EBR epoch guarantee).
+    /// CEP:COST: O(capacity)
+    /// CEP:EVIDENCE: ASan clean under the CI gate; `resize_preserves_entries`
+    fn drop(&mut self) {
+        for slot in self.slots.iter_mut() {
+            let p = slot.value.swap(null_mut(), Ordering::AcqRel);
+            if !p.is_null() {
+                // CEP:UNSAFE | Safety: sole ownership of the pointed-to Box
+                //             (every producer path stores it exactly once;
+                //             resizes swap it to null before re-storing).
+                // CEP:ASSUMES: quiescence per the EBR/teardown contract.
+                // CEP:SECURITY: internal provenance.
+                drop(unsafe { Box::from_raw(p) });
+            }
+        }
     }
 }
 
@@ -270,27 +305,39 @@ impl<V> ShardedMap<V> {
                 SlotState::Full => {
                     // CEP:ASSUMES: state protocol upheld by insert/remove.
                     // CEP:SECURITY: no untrusted input.
-                    // CEP:UNSAFE | Safety: key/value are immutable once Full
-                    //             (protocol); reading them without the writer
+                    // CEP:UNSAFE | Safety: key is immutable once Full
+                    //             (protocol); reading it without the writer
                     //             lock is sound.
                     let k = unsafe { *table.slots[i].key.get() };
                     if k == key {
-                        // CEP:ASSUMES: Full => Some (insert invariant).
+                        let p = table.slots[i].value.load(Ordering::Acquire);
+                        if p.is_null() {
+                            // Transient: a concurrent remove/resize moved the
+                            // value out between our state load and this load.
+                            // Linearizes as a miss; the entry either reappears
+                            // via the new table or was removed.
+                            return None;
+                        }
+                        // CEP:UNSAFE | Safety: reference from the atomically-loaded
+                        //             pointer; the Acquire load above pairs with the
+                        //             writer's FULL/Release publication (insert) or
+                        //             the AcqRel swap (overwrite/remove), so the
+                        //             pointed-to V is fully constructed and
+                        //             heap-stable (EBR-deferred reclamation).
+                        // CEP:ASSUMES: p non-null (checked above).
                         // CEP:SECURITY: internal provenance.
-                        // CEP:UNSAFE | Safety: value is Option<Box<V>>; a Full
-                        //             slot invariantly holds Some (insert
-                        //             publishes Some before setting Full). The
-                        //             Box target is heap-stable; removal only
-                        //             tombstones and retires the Box via EBR,
-                        //             so the reference lives as long as the
-                        //             guard.
-                        let v = unsafe { &*table.slots[i].value.get() };
-                        let boxed = v.as_ref()?;
-                        let ptr: &V = boxed;
+                        let ptr: &V = unsafe { &*p };
                         // CEP:UNSAFE | Safety: the transmute extends the borrow
                         //             to the guard lifetime; sound per the EBR
                         //             argument in Shard::current (table
                         //             retirement is deferred past guard drop).
+                        //             The Box target is heap-stable: removal and
+                        //             overwrite retire it via EBR, and resize
+                        //             moves it into the new table whose own
+                        //             retirement is likewise EBR-gated — so the
+                        //             reference lives as long as the guard.
+                        // CEP:ASSUMES: guard pins reclamation (EBR contract).
+                        // CEP:SECURITY: internal provenance.
                         return Some(unsafe { mem::transmute::<&'_ V, &'g V>(ptr) });
                     }
                 }
@@ -371,18 +418,17 @@ impl<V> ShardedMap<V> {
                     // CEP:UNSAFE | Safety: immutable-key read under protocol.
                     let k = unsafe { *table.slots[i].key.get() };
                     if k == key {
-                        // Overwrite: swap value, retire the old box.
-                        let old = {
-                            // CEP:UNSAFE | Safety: writer-locked exclusive access; Full
-                            //             slot value swap is safe because
-                            //             readers only take &V references whose
-                            //             validity is EBR-deferred.
+                        // Overwrite: atomically swap the value pointer, retire
+                        // the old box. Pinned readers that already loaded the
+                        // old pointer keep a valid reference until their guard
+                        // drops (EBR); readers arriving later see the new one.
+                        let new_ptr = Box::into_raw(value);
+                        let old = table.slots[i].value.swap(new_ptr, Ordering::AcqRel);
+                        if !old.is_null() {
+                            // CEP:UNSAFE | Safety: sole ownership passed to EBR;
+                            //             no reader will dereference past guard drop.
                             // CEP:ASSUMES: guard protects retiring readers.
-                            let cell = unsafe { &mut *table.slots[i].value.get() };
-                            cell.replace(value)
-                        };
-                        if let Some(old_box) = old {
-                            guard.retire_box(old_box);
+                            guard.retire_box(unsafe { Box::from_raw(old) });
                         }
                         return Ok(());
                     }
@@ -445,13 +491,17 @@ impl<V> ShardedMap<V> {
             Err(_) => return Err(ShardError::TableCorrupted),
         }
         // CEP:UNSAFE | Safety: under Reserved, this writer exclusively owns the slot;
-        //             key/value writes are plain stores, then Full publishes.
+        //             key write is a plain store and the value pointer store is
+        //             Relaxed (no reader loads either until the Full Release
+        //             store below publishes both).
         // CEP:ASSUMES: state == Reserved (we just won the CAS).
         // CEP:SECURITY: internal provenance.
         unsafe {
             *table.slots[slot].key.get() = key;
-            *table.slots[slot].value.get() = Some(value);
         }
+        table.slots[slot]
+            .value
+            .store(Box::into_raw(value), Ordering::Relaxed);
         table.slots[slot]
             .state
             .store(SlotState::Full as u8, Ordering::Release);
@@ -481,35 +531,42 @@ impl<V> ShardedMap<V> {
         if old_ptr.is_null() {
             return Err(ShardError::TableCorrupted);
         }
-        // CEP:UNSAFE | Safety: writer-locked old table access (mutable: value Boxes are
-        //             MOVED out during the copy below, leaving None behind).
+        // CEP:UNSAFE | Safety: SHARED reference to the old table: concurrent
+        //             lock-free readers may be mid-probe (they hold EBR
+        //             guards, which defers the table's reclamation). All
+        //             mutations below go through atomics (value swap), never
+        //             plain writes — the pre-session &mut + Option::take was
+        //             an aliasing violation racing those readers.
         // CEP:ASSUMES: pointer provenance internal; writer lock held.
-        let old = unsafe { &mut *old_ptr };
+        let old = unsafe { &*old_ptr };
         let new_cap = (old.mask + 1) * 2;
         let new_table = Table::<V>::new(new_cap)?;
-        for slot in old.slots.iter_mut() {
+        for slot in old.slots.iter() {
             if SlotState::from_u8(slot.state.load(Ordering::Acquire)) != Some(SlotState::Full) {
                 continue;
             }
-            // CEP:UNSAFE | Safety: Full-slot key read (immutable) and value
-            //             take (mutable move-out under the writer lock;
-            //             leaves None behind so the retired old table never
-            //             double-drops).
-            let (k, v) = unsafe { (*slot.key.get(), &mut *slot.value.get()) };
+            // Atomically move the value pointer out of the old slot; readers
+            // between the state load and their own pointer load see null and
+            // linearize as a transient miss (documented in get).
+            let p = slot.value.swap(null_mut(), Ordering::AcqRel);
+            if p.is_null() {
+                // Already moved (impossible under the writer lock; defensive).
+                continue;
+            }
+            // CEP:UNSAFE | Safety: Full-slot key read (immutable).
+            let k = unsafe { *slot.key.get() };
             let mut i = (k as usize) & new_table.mask;
             for _ in 0..=new_table.mask {
                 if SlotState::from_u8(new_table.slots[i].state.load(Ordering::Acquire))
                     == Some(SlotState::Empty)
                 {
-                    // CEP:UNSAFE | Safety: private table (not yet published): plain writes.
+                    // CEP:UNSAFE | Safety: private table (not yet published): plain
+                    //             key write; the value pointer is stored Relaxed
+                    //             and published by the Full Release store below.
                     unsafe {
                         *new_table.slots[i].key.get() = k;
-                        // Move the Box from old to new (old is being retired
-                        // whole; slots must not double-own). We take the Option
-                        // out of the old slot and leave None — the old table's
-                        // Drop must therefore NOT drop slot values.
-                        *new_table.slots[i].value.get() = v.take();
                     }
+                    new_table.slots[i].value.store(p, Ordering::Relaxed);
                     new_table.slots[i]
                         .state
                         .store(SlotState::Full as u8, Ordering::Release);
@@ -523,9 +580,10 @@ impl<V> ShardedMap<V> {
         let new_ptr = Box::into_raw(Box::new(new_table));
         let retired_old = shard.table.value.swap(new_ptr, Ordering::AcqRel);
         // CEP:UNSAFE | Safety: reconstructing the old table Box to retire it; its
-        //             slot-value Options were taken (None) during the copy, so
-        //             dropping it frees only the slot array, never a value.
-        // CEP:ASSUMES: every Full slot's Option was taken by the copy loop.
+        //             slot value pointers were atomically moved out (null) by
+        //             the copy loop above, so its Table::drop frees only the
+        //             slot array, never a value.
+        // CEP:ASSUMES: every Full slot's pointer was moved by the copy loop.
         // CEP:SECURITY: internal provenance.
         let old_table = unsafe { Box::from_raw(retired_old) };
         guard.retire_box(old_table);
@@ -574,15 +632,14 @@ impl<V> ShardedMap<V> {
                     // CEP:UNSAFE | Safety: immutable key read.
                     let k = unsafe { *table.slots[i].key.get() };
                     if k == key {
-                        // Take the value out (old table slot becomes None) and
-                        // retire it; then tombstone.
-                        let old = {
-                            // CEP:UNSAFE | Safety: writer-locked exclusive value swap.
-                            let cell = unsafe { &mut *table.slots[i].value.get() };
-                            cell.take()
-                        };
-                        if let Some(old_box) = old {
-                            guard.retire_box(old_box);
+                        // Atomically take the value pointer out, retire the
+                        // box, then tombstone. Readers between the swap and
+                        // the tombstone see Full + null and linearize as a
+                        // miss (documented in get).
+                        let old = table.slots[i].value.swap(null_mut(), Ordering::AcqRel);
+                        if !old.is_null() {
+                            // CEP:UNSAFE | Safety: sole ownership passed to EBR.
+                            guard.retire_box(unsafe { Box::from_raw(old) });
                         }
                         table.slots[i]
                             .state
@@ -651,12 +708,11 @@ impl<V> Drop for ShardedMap<V> {
             if p.is_null() {
                 continue;
             }
-            // CEP:UNSAFE | Safety: private table drop after quiescence; slot Options are
-            //             the sole owners of the value Boxes (old tables of
-            //             resizes were retired separately and already freed by
-            //             the collector's final drain or will be dropped with
-            //             it — but collector retirement frees the TABLE boxes
-            //             whose slot values were taken; no double drop).
+            // CEP:UNSAFE | Safety: private table drop after quiescence; slot value
+            //             pointers are the sole owners of the value Boxes
+            //             (resized-away tables were EBR-retired and their
+            //             pointers atomically moved out first), so Table::drop
+            //             frees each value exactly once.
             // CEP:ASSUMES: quiescence (owner contract).
             // CEP:SECURITY: internal pointers only.
             let table = unsafe { Box::from_raw(p) };
@@ -666,9 +722,11 @@ impl<V> Drop for ShardedMap<V> {
 }
 
 // CEP:UNSAFE | Safety: Sync when V: Send — readers use Acquire loads on the published
-//             table pointer and slot states; writers serialize via the shard
-//             try-lock; memory reclamation is EBR-deferred. UnsafeCell contents
-//             are written only under Reserved (writer-locked) or quiescence.
+//             table pointer, slot states, and slot value pointers; writers
+//             serialize via the shard try-lock and swap value pointers with
+//             AcqRel; memory reclamation is EBR-deferred. No non-atomic
+//             field is ever accessed by two threads concurrently (key writes
+//             happen under Reserved, which readers never dereference).
 // CEP:ASSUMES: guards held by readers for reference lifetimes.
 // CEP:SECURITY: no untrusted input.
 unsafe impl<V: Send> Sync for ShardedMap<V> {}

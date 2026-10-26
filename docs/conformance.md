@@ -334,3 +334,78 @@ surfaced in `SearchOutcome`) and carries an executable witness:
 asserts identical frontier content. Gates at commit: 279 tests (0 failed),
 clippy -D warnings clean, fmt clean, cep_lint 91 files 0 violations;
 test-scoped clippy::expect_used allowances are waiver W-5.
+
+
+## CI hard gates and the end of skipped tests (session 6)
+
+The user directive "stop skipping test" surfaced two classes of tolerated
+failure in the live CI. First, the sanitizer matrix ran with
+`continue-on-error: true` (the CEP-27 soft gate). Second, its test step
+(`cargo test --workspace --tests --target x86_64-unknown-linux-gnu`)
+compiled the CLI tools only as TEST targets — no runnable binaries were
+produced — while `tests/cli.rs` resolved them by a hardcoded
+`target/debug/` path; under the `--target` layout that is ENOENT, and four
+integration tests failed with `spawn failed` / swallowed error assertions
+(the exact failures in the user's log). The reproduction was recreated
+locally bit-for-bit before any fix.
+
+**Fix 1 — tool resolution (tests/cli.rs):** `run_tool` now resolves the
+binaries by a deterministic candidate search: `CARGO_BIN_EXE_<tool>`, the
+running test binary's ancestor directories (covers `target/debug`,
+`target/<triple>/debug`, and the sanitizer build layout), then the
+manifest-relative target tree including every triple directory, preferring
+an existing file and falling back to the classic path so a missing build
+still fails recognizably. (The `Err(_) => return` arms in
+`jit_boundary_flow` follow the house assert-first pattern — the assert is
+the loud gate; they were never silent.) The sanitizer job gains an
+explicit workspace build step before testing.
+
+**Fix 2 — chase_lev data race (CEP-0):** the TSan leg (rebuilt with
+`-Zbuild-std`, which current nightly requires) reproduced a genuine data
+race: `steal`'s pre-CAS speculative slot read vs `push`'s masked write to
+the aliased slot after index wraparound — formally UB, silently benign on
+x86 because the CAS loser discards the value. The deque now carries a
+per-physical-slot state word (Go-runq discipline): `push` writes data only
+after observing the slot FREE (Acquire) and publishes FULL (Release) before
+advancing `bottom`; `steal` wins the top CAS FIRST, then observes FULL
+(Acquire, pairing with the push's Release) before reading, and publishes
+FREE (Release) after; `pop` reads only after arbitration and publishes
+FREE. Every non-atomic slot access is thus sandwiched between ordering
+edges, and the wraparound hazard is closed by construction — an aliased
+push at index t + capacity cannot proceed while the reader of index t
+holds the slot FULL. A transiently held slot reports retryable `Full`
+(documented backpressure). All 8 deque tests and the executor/pool suites
+pass unchanged.
+
+**Fix 3 — sharded map data race (CEP-0/1):** TSan reproduced a second race:
+`get`'s lock-free `as_ref` on `UnsafeCell<Option<Box<V>>>` vs the writer's
+`replace`/`take` under the shard writer lock — a lock readers never take;
+the old safety comments claimed value immutability-once-Full that the
+overwrite/remove/resize paths violated, and `resize_locked` additionally
+took `&mut` to a table concurrent readers were probing. Slot values are now
+`AtomicPtr<V>` (null = absent): readers Acquire-load the pointer; overwrite
+and remove swap it out atomically (AcqRel) and EBR-retire the old box;
+resize moves pointers out of the shared-referenced old table atomically
+into the new one (the aliasing violation is gone), and `Table::drop`
+reclaims exactly the pointers it still owns. A reader between a state
+observation and its pointer load linearizes as a transient miss.
+
+**Gate promotion:** both sanitizer legs are hard gates on pinned
+`nightly-2026-10-25` (verified locally; the pin advances deliberately —
+floating nightly is what silently broke the TSan leg), with
+`TSAN_OPTIONS=halt_on_error=1` so a race aborts the process instead of
+printing and exiting 0 (verified: the pre-fix code failed, the post-fix
+code passes). Local evidence at commit: ASan leg 279/279 clean, TSan leg
+(`-Zbuild-std`) 279/279 clean with ZERO race reports; plain debug/release
+runs unchanged. The floating-nightly job also hid that TSan on current
+nightly REQUIRES `-Zbuild-std` (uninstrumented std is an ABI-mismatch
+hard error).
+
+**Always-on benchmarking:** bench evidence moved out of ci.yml's build-test
+job into `.github/workflows/bench.yml` (mirrored at
+`docs/bench-workflow.reference.yml`): anvil_bench + kernel_bench (smoke
+scale 0.1) on every push to main, every PR, daily at 06:00 UTC, and on
+manual dispatch; artifacts are archived per run with 90-day retention;
+`scripts/bench.sh` reproduces the same evidence locally. Numbers stay
+advisory (shared-runner timings are noise, not gates) while the benches'
+built-in correctness assertions remain hard.
