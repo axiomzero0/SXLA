@@ -160,9 +160,18 @@ fn bad_input_is_rejected() {
 }
 
 // CEP:WHAT: The SPSC JIT boundary flow compiles and caches across the
-//           thread boundary (in-process driver-level check).
+//           thread boundary (in-process driver-level check). Both sides
+//           wait on a WALL-CLOCK deadline, never a fixed spin count: a
+//           spin budget is a hidden timing assumption whose real duration
+//           depends on scheduler speed (the 100k-yield budget expired on
+//           a loaded 2-core CI runner — run 40389408104 — before the
+//           worker finished compiling), and the worker retries pops
+//           instead of bailing on the first Empty (spawn happens before
+//           the producer pushes, so the first pop can legitimately
+//           observe an empty ring).
 // CEP:STATUS: complete
-// CEP:FAILURE: assert fires on boundary deadlock or loss.
+// CEP:FAILURE: assert fires on boundary deadlock (at the 30s deadline —
+//          loud, bounded) or loss.
 // CEP:ASSUMES: none
 // CEP:COST: test-only
 // CEP:EVIDENCE: this test
@@ -186,11 +195,23 @@ fn jit_boundary_flow() {
         Err(_) => return,
     };
     let boundary = JitBoundary::new(16);
+    // Wall-clock deadline for BOTH sides: loud, bounded failure on a
+    // true deadlock; no timing assumption in the success path.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + WAIT;
     let ok = std::thread::scope(|s| {
-        // Compiler worker.
-        let _worker = s.spawn(|| {
+        // Compiler worker: pops with retry — the request may not be
+        // visible yet when the worker is first scheduled.
+        let _worker = s.spawn(|| loop {
             let req = match boundary.pop_request() {
                 Ok(r) => r,
+                Err(anvil::spsc::QueueError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
                 Err(_) => return false,
             };
             // Compile for the requested fingerprint (same source; the
@@ -213,14 +234,14 @@ fn jit_boundary_flow() {
             if cache.insert(key, entry, slot).is_err() {
                 return false;
             }
-            boundary
+            return boundary
                 .push_response(jit::boundary::CompileResponse {
                     kernel_key: key,
                     tier: c.tier,
                     failed: false,
                     _pad: 0,
                 })
-                .is_ok()
+                .is_ok();
         });
         // Execution thread: request Tier-1 compilation.
         let req = CompileRequest {
@@ -232,14 +253,26 @@ fn jit_boundary_flow() {
         if boundary.push_request(req).is_err() {
             return false;
         }
-        for _ in 0..100_000 {
+        // Deadline-bounded wait: spin first for latency, then poll-sleep
+        // so a slow runner does not burn its cores for the full budget.
+        let mut spins = 0u64;
+        loop {
             match boundary.pop_response() {
                 Ok(resp) => return !resp.failed,
-                Err(anvil::spsc::QueueError::Empty) => std::thread::yield_now(),
+                Err(anvil::spsc::QueueError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    spins += 1;
+                    if spins > 10_000 {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
                 Err(_) => return false,
             }
         }
-        false
     });
     assert!(ok, "boundary flow failed");
     assert_eq!(cache.len(), 1);

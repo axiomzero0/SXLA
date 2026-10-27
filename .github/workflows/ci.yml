@@ -34,6 +34,10 @@ jobs:
   build-test:
     name: build + test + clippy + fmt + cep-lint
     runs-on: ubuntu-latest
+    # Bounded: a hung cross-thread test (or any regression that stalls a
+    # step) must fail the job in minutes, not park it for the 360-minute
+    # GitHub default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,6 +57,9 @@ jobs:
   sanitizers:
     name: sanitizers (${{ matrix.sanitizer }} — hard gate)
     runs-on: ubuntu-latest
+    # Bounded (see build-test); generous for the -Zbuild-std TSan leg,
+    # which compiles std from source under instrumentation.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

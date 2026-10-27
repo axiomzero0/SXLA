@@ -21,17 +21,18 @@
 //           + 1 CAS + possible resize (writer path allocation).
 // CEP:EVIDENCE: tests `insert_get_roundtrip`, `remove_tombstones`,
 //           `resize_preserves_entries`, `stress_readers_vs_writer`
-//           (8 readers + 1 writer, 100k ops); benches/anvil_bench.rs.
+//           (8 readers + 1 writer, 100k ops),
+//           `stress_remove_reinsert_vs_readers` (the tombstone-reuse race
+//           window the TSan gate now covers); benches/anvil_bench.rs.
 // CEP:SECURITY: bounded probe cycles; all indices masked; no untrusted input
 //           reaches raw pointers.
 // CEP:HPC-DETERMINISM: get/insert/remove results are deterministic; iteration
 //           order is NOT exposed (determinism-safe API — CEP&CC 38.10).
 //! Sharded lock-free-read map.
 
-use core::cell::UnsafeCell;
 use core::mem;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::config::SHARD_COUNT;
 use crate::ebr::Guard;
@@ -61,9 +62,14 @@ pub enum ShardError {
 ///
 /// CEP:WHAT: State machine for one hash-table slot.
 /// CEP:WHY: EMPTY -> RESERVED (writer CAS) -> FULL (Release publish) gives
-///          readers a linearization point: a FULL slot's key/value are
-///          immutable and safely loadable; TOMBSTONE marks logical deletion
-///          with deferred physical destruction (EBR).
+///          readers a linearization point; TOMBSTONE marks logical deletion
+///          with deferred physical destruction (EBR). A STALE reader (one
+///          that loaded FULL for generation A and was preempted) may later
+///          observe generation B's key/value in the same slot after
+///          tombstone-reuse reinsert: keys are ATOMIC so the observation is
+///          defined behavior (a mismatch simply probes on), and generation
+///          B's value pointer is published with Release so any reader that
+///          Acquire-loads it gets a fully constructed V.
 /// CEP:STATUS: complete
 /// CEP:FAILURE: none
 /// CEP:ASSUMES: transitions happen only under the documented protocol.
@@ -106,8 +112,12 @@ impl SlotState {
 struct Slot<V> {
     /// Slot lifecycle state (see SlotState).
     state: AtomicU8,
-    /// Key; written once under Reserved, immutable once Full.
-    key: UnsafeCell<u64>,
+    /// Key. Written once under Reserved (Relaxed store), read by lock-free
+    /// readers (Relaxed load): ATOMIC on both sides because a stale reader
+    /// can observe a re-occupied generation's key after tombstone reuse —
+    /// a non-atomic cell raced the reinsert writer's plain key write
+    /// (TSan-reproduced, session 7). A key mismatch just probes on.
+    key: AtomicU64,
     /// Value pointer; null == absent. The pointed-to V is owned by the
     /// slot (or, after a resize move, by the new table's slot). Swapped
     /// atomically (AcqRel) so lock-free readers never race a writer's
@@ -145,7 +155,7 @@ impl<V> Table<V> {
         for _ in 0..capacity {
             slots.push(Slot {
                 state: AtomicU8::new(SlotState::Empty as u8),
-                key: UnsafeCell::new(0),
+                key: AtomicU64::new(0),
                 value: AtomicPtr::new(null_mut()),
             });
         }
@@ -305,10 +315,16 @@ impl<V> ShardedMap<V> {
                 SlotState::Full => {
                     // CEP:ASSUMES: state protocol upheld by insert/remove.
                     // CEP:SECURITY: no untrusted input.
-                    // CEP:UNSAFE | Safety: key is immutable once Full
-                    //             (protocol); reading it without the writer
-                    //             lock is sound.
-                    let k = unsafe { *table.slots[i].key.get() };
+                    // The key load is ATOMIC (Relaxed) on purpose: this
+                    // reader may have loaded generation A's Full state and
+                    // been preempted while the slot was tombstoned and
+                    // re-occupied with a new key — a plain cell read raced
+                    // the reinsert writer (TSan-reproduced, session 7).
+                    // Relaxed is sufficient: a mismatch probes on (late
+                    // linearization), and a same-key match is only possible
+                    // for the reinsert's Release-published value, which the
+                    // Acquire value load below pairs with.
+                    let k = table.slots[i].key.load(Ordering::Relaxed);
                     if k == key {
                         let p = table.slots[i].value.load(Ordering::Acquire);
                         if p.is_null() {
@@ -415,8 +431,10 @@ impl<V> ShardedMap<V> {
                     return Ok(());
                 }
                 SlotState::Full => {
-                    // CEP:UNSAFE | Safety: immutable-key read under protocol.
-                    let k = unsafe { *table.slots[i].key.get() };
+                    // Writer-locked read; Relaxed is enough (single writer),
+                    // but the cell is atomic so lock-free stale readers can
+                    // read it safely (see get).
+                    let k = table.slots[i].key.load(Ordering::Relaxed);
                     if k == key {
                         // Overwrite: atomically swap the value pointer, retire
                         // the old box. Pinned readers that already loaded the
@@ -490,30 +508,35 @@ impl<V> ShardedMap<V> {
             Ok(_) => {}
             Err(_) => return Err(ShardError::TableCorrupted),
         }
-        // CEP:UNSAFE | Safety: under Reserved, this writer exclusively owns the slot;
-        //             key write is a plain store and the value pointer store is
-        //             Relaxed (no reader loads either until the Full Release
-        //             store below publishes both).
+        // CEP:UNSAFE | Safety: under Reserved, this writer exclusively owns
+        //             the slot. The key store is ATOMIC (Relaxed): lock-free
+        //             readers that went stale on generation A may read this
+        //             cell while we write generation B — atomics on both
+        //             sides make that defined (mismatch -> probe on). The
+        //             value pointer store is RELEASE: a stale reader that
+        //             missed generation A's publication and Acquire-loads
+        //             generation B's pointer must still get a fully
+        //             constructed V (the previous Relaxed store left that
+        //             path unordered — TSan-reproduced, session 7; the Full
+        //             Release store below only orders same-generation
+        //             readers).
         // CEP:ASSUMES: state == Reserved (we just won the CAS).
         // CEP:SECURITY: internal provenance.
-        unsafe {
-            *table.slots[slot].key.get() = key;
-        }
+        table.slots[slot].key.store(key, Ordering::Relaxed);
         table.slots[slot]
             .value
-            .store(Box::into_raw(value), Ordering::Relaxed);
+            .store(Box::into_raw(value), Ordering::Release);
         table.slots[slot]
             .state
             .store(SlotState::Full as u8, Ordering::Release);
         table.used.fetch_add(1, Ordering::AcqRel);
         self.len.fetch_add(1, Ordering::AcqRel);
-        // Resize check: grow at 75% load (writer path).
-        if table.used.load(Ordering::Acquire) * 4 > (table.mask + 1) * 3 {
-            // Defer actual resize to the next insert to keep this one O(1);
-            // load factor stays bounded because the very next insert resizes.
-            // (Documented amortization; see resize_locked.)
-            return Ok(());
-        }
+        // NOTE: no resize is scheduled at the 75% mark despite the header's
+        // reference target — growth actually happens only when an insert
+        // finds NO empty slot in a full probe cycle (insert_locked's
+        // saturation path), so load factor can reach ~1.0 and probe lengths
+        // degrade before the table doubles. (Deferred-resize redesign is a
+        // CEP ticket; this comment documents the real policy.)
         Ok(())
     }
 
@@ -553,20 +576,23 @@ impl<V> ShardedMap<V> {
                 // Already moved (impossible under the writer lock; defensive).
                 continue;
             }
-            // CEP:UNSAFE | Safety: Full-slot key read (immutable).
-            let k = unsafe { *slot.key.get() };
+            // Writer-locked read; the cell is atomic for lock-free stale
+            // readers (see get) — Relaxed suffices here.
+            let k = slot.key.load(Ordering::Relaxed);
             let mut i = (k as usize) & new_table.mask;
             for _ in 0..=new_table.mask {
                 if SlotState::from_u8(new_table.slots[i].state.load(Ordering::Acquire))
                     == Some(SlotState::Empty)
                 {
-                    // CEP:UNSAFE | Safety: private table (not yet published): plain
-                    //             key write; the value pointer is stored Relaxed
-                    //             and published by the Full Release store below.
-                    unsafe {
-                        *new_table.slots[i].key.get() = k;
-                    }
-                    new_table.slots[i].value.store(p, Ordering::Relaxed);
+                    // CEP:UNSAFE | Safety: private table (not yet published): the
+                    //             key store is Relaxed (atomic for uniformity
+                    //             with the reader protocol) and the value
+                    //             pointer store is RELEASE (defense in depth:
+                    //             pairs with a reader's Acquire load even out
+                    //             of band); same-generation publication is via
+                    //             the Full Release store below.
+                    new_table.slots[i].key.store(k, Ordering::Relaxed);
+                    new_table.slots[i].value.store(p, Ordering::Release);
                     new_table.slots[i]
                         .state
                         .store(SlotState::Full as u8, Ordering::Release);
@@ -629,8 +655,9 @@ impl<V> ShardedMap<V> {
                     break;
                 }
                 if state == SlotState::Full {
-                    // CEP:UNSAFE | Safety: immutable key read.
-                    let k = unsafe { *table.slots[i].key.get() };
+                    // Writer-locked read; atomic cell (see get), Relaxed is
+                    // enough.
+                    let k = table.slots[i].key.load(Ordering::Relaxed);
                     if k == key {
                         // Atomically take the value pointer out, retire the
                         // box, then tombstone. Readers between the swap and
@@ -721,12 +748,16 @@ impl<V> Drop for ShardedMap<V> {
     }
 }
 
-// CEP:UNSAFE | Safety: Sync when V: Send — readers use Acquire loads on the published
-//             table pointer, slot states, and slot value pointers; writers
-//             serialize via the shard try-lock and swap value pointers with
-//             AcqRel; memory reclamation is EBR-deferred. No non-atomic
-//             field is ever accessed by two threads concurrently (key writes
-//             happen under Reserved, which readers never dereference).
+// CEP:UNSAFE | Safety: Sync when V: Send — every slot field accessed
+//             cross-thread without the writer lock is atomic (state:
+//             Acquire both sides; key: Relaxed reader loads, stores under
+//             Reserved; value: Acquire reader loads, Release/AcqRel
+//             stores). A stale reader CAN observe a re-occupied
+//             generation's key and value after tombstone reuse — exactly
+//             why the key cell is atomic and the occupy-path value store
+//             is Release (both TSan-reproduced with a concurrent
+//             remove/reinsert hammer, session 7). Reclamation is
+//             EBR-deferred.
 // CEP:ASSUMES: guards held by readers for reference lifetimes.
 // CEP:SECURITY: no untrusted input.
 unsafe impl<V: Send> Sync for ShardedMap<V> {}
@@ -772,8 +803,10 @@ mod tests {
             Err(_) => return,
         };
         for k in 0..100u64 {
+            // Single writer per shard: Busy is impossible — do not tolerate
+            // it (a tolerated failure here would be a vacuous pass).
             let r = map.insert(k, k * 7, &g);
-            assert!(r.is_ok() || r == Err(ShardError::Busy));
+            assert!(r.is_ok(), "insert {} failed: {:?}", k, r);
         }
         for k in 0..100u64 {
             let got = map.get(k, &g);
@@ -807,12 +840,14 @@ mod tests {
             Err(_) => return,
         };
         for k in 0..10u64 {
-            let _ = map.insert(k, k, &g);
+            let r = map.insert(k, k, &g);
+            assert!(r.is_ok(), "insert {} failed: {:?}", k, r);
         }
         assert!(map.remove(5, &g).is_ok());
         assert!(map.get(5, &g).is_none());
         // Reinsert into the tombstone.
-        let _ = map.insert(5, 55, &g);
+        let r = map.insert(5, 55, &g);
+        assert!(r.is_ok(), "reinsert failed: {:?}", r);
         let got = map.get(5, &g);
         assert!(got.is_some());
         if let Some(v) = got {
@@ -895,7 +930,9 @@ mod tests {
                     loop {
                         let g = match collector_ref.pin(slot) {
                             Ok(g) => g,
-                            Err(_) => return 0u64,
+                            // Loud: a setup failure must FAIL the test, not
+                            // vacuously contribute zero checks.
+                            Err(_) => return u64::MAX,
                         };
                         let k = (spins % KEYS) * SHARD_COUNT as u64;
                         if let Some(v) = map_ref.get(k, &g) {
@@ -959,5 +996,98 @@ mod tests {
         });
         assert!(ok);
         assert_eq!(map.len() as u64, KEYS);
+    }
+
+    // CEP:WHAT: Concurrent remove/reinsert hammer vs lock-free readers — the
+    //           tombstone-reuse window a reader can hit while stale on a
+    //           previous generation. TSan-reproduced data race (session 7,
+    //           exit 66 under exact CI gate semantics): the reader's plain
+    //           key read raced the reinsert writer's key write, and the
+    //           Relaxed value store let a stale reader's Acquire load pair
+    //           with nothing. The fix under test: atomic key cell (Relaxed
+    //           both sides) + Release value publication in occupy_slot.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: assert fires on torn value or a writer-step failure; the
+    //           CI TSan leg (halt_on_error=1) fails on any key/value race
+    //           in the window.
+    // CEP:ASSUMES: scoped threads join before drop.
+    // CEP:COST: test-only; ~200k reader checks + 20k remove/insert pairs
+    // CEP:EVIDENCE: this test; TSan in CI
+    #[test]
+    fn stress_remove_reinsert_vs_readers() {
+        const READERS: usize = 4;
+        const PAIRS: u64 = 20_000;
+        let collector = Collector::new();
+        let made = ShardedMap::new(64);
+        assert!(made.is_ok());
+        let map: Box<ShardedMap<u64>> = match made {
+            Ok(m) => m,
+            // Unreachable after the assert above (house loud-setup pattern).
+            Err(_) => return,
+        };
+        let ok = std::thread::scope(|s| {
+            let mut reader_slots = Vec::with_capacity(READERS);
+            for _ in 0..READERS {
+                match collector.register() {
+                    Ok(sl) => reader_slots.push(sl),
+                    Err(_) => return false,
+                }
+            }
+            let map_ref: &ShardedMap<u64> = &map;
+            let collector_ref: &Collector = &collector;
+            let mut handles = Vec::with_capacity(READERS);
+            // Readers hammer the SAME key the writer removes/reinserts, so
+            // probes constantly land on the recycled slot.
+            for slot in reader_slots {
+                handles.push(s.spawn(move || {
+                    let mut spins = 0u64;
+                    while spins < 50_000 {
+                        let g = match collector_ref.pin(slot) {
+                            Ok(g) => g,
+                            // Loud: a setup failure must FAIL the test.
+                            Err(_) => return false,
+                        };
+                        // The value is either absent (mid-cycle) or 35 —
+                        // never torn, never stale-constructed.
+                        if let Some(v) = map_ref.get(7, &g) {
+                            if *v != 35 {
+                                return false; // torn read: fatal
+                            }
+                        }
+                        drop(g);
+                        spins += 1;
+                        if spins.is_multiple_of(64) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    true
+                }));
+            }
+            // Single writer: alternate remove/insert on the hot key,
+            // forcing a tombstone-then-reuse of the same slot every cycle.
+            let wslot = match collector.register() {
+                Ok(sl) => sl,
+                Err(_) => return false,
+            };
+            let g = match collector.pin(wslot) {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            for _ in 0..PAIRS {
+                if map_ref.remove(7, &g).is_err() {
+                    return false;
+                }
+                if map_ref.insert(7, 35, &g).is_err() {
+                    return false;
+                }
+            }
+            let mut all = true;
+            for h in handles {
+                all &= h.join().unwrap_or(false);
+            }
+            all
+        });
+        assert!(ok, "readers saw torn data or a writer step failed");
+        assert_eq!(map.len(), 1);
     }
 }

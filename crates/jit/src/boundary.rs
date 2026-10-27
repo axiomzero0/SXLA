@@ -194,14 +194,25 @@ mod tests {
     }
 
     // CEP:WHAT: The worker serves a request across threads (SPSC contract).
+    //           Both sides wait on a WALL-CLOCK deadline, never a fixed
+    //           spin count (a spin budget is a hidden timing assumption —
+    //           its real duration depends on scheduler speed), and the
+    //           worker never spins forever: an unbounded worker loop would
+    //           hang the scope join if the producer failed before pushing.
     // CEP:STATUS: complete
-    // CEP:FAILURE: assert fires on cross-thread loss.
+    // CEP:FAILURE: assert fires on cross-thread loss or deadline expiry
+    //          (loud, bounded).
     // CEP:ASSUMES: scoped threads.
     // CEP:COST: test-only
     // CEP:EVIDENCE: this test
     #[test]
     fn worker_serves_request() {
         let b = JitBoundary::new(64);
+        // Wall-clock deadline on BOTH sides: loud, bounded failure on a
+        // true deadlock; the worker side also cannot hang the scope join
+        // if the producer never pushes.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + WAIT;
         let ok = std::thread::scope(|s| {
             // Compiler worker: borrows the boundary (scoped thread).
             // Serves exactly ONE request, then exits so the scope can join.
@@ -216,7 +227,12 @@ mod tests {
                         };
                         return b.push_response(resp).is_ok();
                     }
-                    Err(QueueError::Empty) => std::thread::yield_now(),
+                    Err(QueueError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::yield_now();
+                    }
                     Err(QueueError::Full) => return false,
                 }
             });
@@ -230,17 +246,28 @@ mod tests {
             if b.push_request(req).is_err() {
                 return false;
             }
-            // Wait for the response (bounded spin).
-            for _ in 0..100_000 {
+            // Deadline-bounded wait: spin first for latency, then
+            // poll-sleep so a slow runner does not burn its cores.
+            let mut spins = 0u64;
+            loop {
                 match b.pop_response() {
                     Ok(resp) => {
                         return resp.kernel_key == 11 ^ 3 && resp.tier == Tier::Tier1;
                     }
-                    Err(QueueError::Empty) => std::thread::yield_now(),
+                    Err(QueueError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        spins += 1;
+                        if spins > 10_000 {
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
                     Err(QueueError::Full) => return false,
                 }
             }
-            false
         });
         assert!(ok);
     }

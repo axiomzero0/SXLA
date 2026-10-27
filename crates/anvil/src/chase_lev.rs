@@ -285,10 +285,11 @@ impl<T> Deque<T> {
             Ok(_) => {
                 // We own index t. Acquire-load the slot state: it pairs with
                 // the owner push's FULL Release store, establishing
-                // happens-before from the data write to the read below. (The
-                // b > t observation above already implies FULL is visible:
-                // the FULL store is sequenced before the bottom Release
-                // store that our Acquire load observed.)
+                // happens-before from the data write to the read below.
+                // (The guarantee comes from THIS FULL Release<->Acquire
+                // pairing on states[slot], not from the bottom store: pop
+                // publishes bottom with Relaxed stores, so the b > t
+                // observation alone does not order the slot payload.)
                 if self.states[slot].load(Ordering::Acquire) != SLOT_FULL {
                     // Unreachable per the happens-before argument; defensive
                     // retry keeps the no-panic contract if memory is corrupt.

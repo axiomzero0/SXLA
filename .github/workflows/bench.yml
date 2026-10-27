@@ -10,9 +10,14 @@
 # CEP:CLASS: CEP-2
 # CEP:STATUS: complete (session 6: split out of ci.yml's build-test job and
 #          made always-on per the standing directive "benchmark it all the
-#          time").
+#          time". Session 7: both tee steps now run under `shell: bash`
+#          (bash -eo pipefail) — the previous default `bash -e` has NO
+#          pipefail, so a bench panic's exit 101 was masked by tee's 0 and
+#          the CEP:FAILURE gate below was silently false).
 # CEP:FAILURE: a failing bench run fails the workflow (the benches are also
-#          correctness harnesses: cross-tier bit agreement is asserted);
+#          correctness harnesses: cross-tier bit agreement is asserted;
+#          the shell: bash pipefail guarantees the tee pipeline propagates
+#          the bench's exit code);
 #          PERFORMANCE regressions are advisory (numbers are archived for
 #          trend comparison, not gated — gating on shared-runner timings
 #          would be noise, not evidence).
@@ -42,12 +47,18 @@ jobs:
   bench:
     name: anvil_bench + kernel_bench (smoke)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: anvil microbenchmarks
+        # shell: bash => bash -eo pipefail: the tee pipeline must propagate
+        # the bench's exit code (a bare `| tee` under `bash -e` exits with
+        # tee's 0 and masks bench failures).
+        shell: bash
         run: cargo run --release --bin anvil_bench | tee .cep/evidence/bench-${{ github.sha }}.txt
       - name: Kernel bench evidence (smoke scale 0.1)
+        shell: bash
         run: cargo run --release --bin kernel_bench -- --scale 0.1 | tee .cep/evidence/kernel-bench-${{ github.sha }}.txt
       - uses: actions/upload-artifact@v4
         with:
